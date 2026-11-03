@@ -250,7 +250,8 @@ void ConvertTritonGPUToLLVM::populateConversionPatterns(
   // TODO(thomas): this should probably be done in a separate step to not
   // interfere with our own lowering of arith ops. Add arith/math's patterns
   // to help convert scalar expression to LLVM.
-  mlir::arith::populateCeilFloorDivExpandOpsPatterns(patterns);
+  // LLVM 24: ceil/floor-div expansion is registered inside
+  // populateArithToLLVMConversionPatterns.
   mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
   mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
   mlir::populateGpuToNVVMConversionPatterns(typeConverter, patterns);

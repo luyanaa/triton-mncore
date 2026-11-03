@@ -368,9 +368,15 @@ static void disableLICM(LLVM::BrOp latchBr) {
   Builder b(latchBr.getContext());
   MLIRContext *ctx = b.getContext();
   auto licmMD = LLVM::LoopLICMAttr::get(ctx, b.getBoolAttr(true), {});
-  auto loopMD =
-      LLVM::LoopAnnotationAttr::get(b.getContext(), {}, {}, {}, {}, {}, licmMD,
-                                    {}, {}, {}, {}, {}, {}, {}, {}, {});
+  // LLVM 24 inserted `align` before startLoc/endLoc and added
+  // `parallelAccesses` at the end; keep placeholders explicit so the next
+  // signature change is a compile error here rather than a silent misbind.
+  auto loopMD = LLVM::LoopAnnotationAttr::get(
+      ctx, /*id=*/{}, /*disableNonforced=*/{}, /*vectorize=*/{},
+      /*interleave=*/{}, /*unroll=*/{}, /*unrollAndJam=*/{}, /*licm=*/licmMD,
+      /*distribute=*/{}, /*pipeline=*/{}, /*peeled=*/{}, /*unswitch=*/{},
+      /*mustProgress=*/{}, /*isVectorized=*/{}, /*align=*/0, /*startLoc=*/{},
+      /*endLoc=*/{}, /*parallelAccesses=*/{});
   latchBr.setLoopAnnotationAttr(loopMD);
 }
 

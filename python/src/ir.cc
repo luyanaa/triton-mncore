@@ -515,7 +515,7 @@ void init_triton_ir(py::module_ &m) {
                                  Location loc) { self.addArgument(ty, loc); })
       .def("get_num_arguments", &Block::getNumArguments)
       .def("get_argument", &Block::getArgument)
-      .def("dump", &Block::dump)
+      .def("dump", [](Block &self) { self.print(llvm::errs()); llvm::errs() << "\n"; })
       .def("move_before",
            [](Block &self, Block &dst) { self.moveBefore(&dst); })
       .def("insert_before", &Block::insertBefore)
@@ -600,7 +600,7 @@ void init_triton_ir(py::module_ &m) {
             return self.getBody(idx);
           },
           ret::reference)
-      .def("dump", [](OpState &self) { self->dump(); })
+      .def("dump", [](OpState &self) { self->print(llvm::errs()); llvm::errs() << "\n"; })
       .def("__str__",
            [](OpState &self) -> std::string {
              std::string str;
@@ -712,7 +712,7 @@ void init_triton_ir(py::module_ &m) {
   // dynamic_attr is used to transfer ownership of the MLIR context to the
   // module
   py::class_<ModuleOp, OpState>(m, "module", py::dynamic_attr())
-      .def("dump", &ModuleOp::dump)
+      .def("dump", [](ModuleOp &self) { self->print(llvm::errs()); llvm::errs() << "\n"; })
       .def("str",
            [](ModuleOp &self) -> std::string {
              std::string str;
@@ -968,8 +968,13 @@ void init_triton_ir(py::module_ &m) {
                                          self.getBuilder().getBoolAttr(true));
              mlir::LLVM::LoopAnnotationAttr la =
                  mlir::LLVM::LoopAnnotationAttr::get(
-                     self.getBuilder().getContext(), {}, {}, {}, {}, {},
-                     licmAttr, {}, {}, {}, {}, {}, {}, {}, {}, {});
+                     self.getBuilder().getContext(), /*id=*/{},
+                     /*disableNonforced=*/{}, /*vectorize=*/{},
+                     /*interleave=*/{}, /*unroll=*/{}, /*unrollAndJam=*/{},
+                     /*licm=*/licmAttr, /*distribute=*/{}, /*pipeline=*/{},
+                     /*peeled=*/{}, /*unswitch=*/{}, /*mustProgress=*/{},
+                     /*isVectorized=*/{}, /*align=*/0, /*startLoc=*/{},
+                     /*endLoc=*/{}, /*parallelAccesses=*/{});
              return la;
            })
       // Use arith.ConstantOp to create constants

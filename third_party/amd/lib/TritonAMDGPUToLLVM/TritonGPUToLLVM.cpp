@@ -14,6 +14,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLTargetInfo.h"
 #include "mlir/Pass/Pass.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -205,16 +206,17 @@ struct ConvertTritonAMDGPUToLLVM
     mlir::triton::AMD::populateWarpIdOpToLLVMPattern(typeConverter, targetInfo,
                                                      patterns, commonBenefit);
 
-    FailureOr<mlir::amdgpu::Chipset> maybeChipset =
-        mlir::amdgpu::Chipset::parse(targetInfo.getBaseArch());
-    if (failed(maybeChipset)) {
+    // LLVM 24 replaces the deprecated amdgpu::Chipset with ROCDL::TargetInfo.
+    FailureOr<ROCDL::TargetInfo> maybeTarget =
+        ROCDL::TargetInfo::get(targetInfo.getBaseArch());
+    if (failed(maybeTarget)) {
       emitError(UnknownLoc::get(&getContext()),
-                "Invalid AMDGPU chipset name: " + this->gfxArch);
+                "Invalid AMDGPU target name: " + this->gfxArch);
       return signalPassFailure();
     }
     // Native lowering patterns
     mlir::populateGpuToROCDLConversionPatterns(
-        typeConverter, patterns, mlir::gpu::amd::HIP, *maybeChipset);
+        typeConverter, patterns, mlir::gpu::amd::HIP, *maybeTarget);
 
     mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
                                                           patterns);
