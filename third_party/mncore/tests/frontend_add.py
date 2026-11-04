@@ -28,13 +28,23 @@ def main():
                    "BLOCK": "constexpr"},
         constexprs={"BLOCK": 256})
     meta = {}
-    mod = src.make_ir(ctx, opts)
+    codegen_fns = backend.get_codegen_implementation(opts)
+    module_map = backend.get_module_map()
+    mod = src.make_ir(target, opts, codegen_fns, module_map, ctx)
     mod = backend.make_ttir(mod, meta, opts)
     print("=== TTIR ===")
     print(str(mod))
     mod = backend.make_ttgir(mod, meta, opts)
     print("=== TTGIR ===")
     print(str(mod))
+    open("/tmp/frontend_add.ttgir", "w").write(str(mod))
+    try:
+        mod = backend.make_mnir(mod, meta, opts)
+        print("=== MNIR ===")
+        print(str(mod))
+    except Exception as e:
+        print("=== MNIR FAILED ===")
+        print(type(e).__name__ + ": " + str(e))
 
 
 if __name__ == "__main__":

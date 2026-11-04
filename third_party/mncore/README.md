@@ -58,6 +58,18 @@ directory.
 3. `CMakeLists.txt` — `add_triton_plugin(TritonMncore triton_mncore.cc
    LINK_LIBS PUBLIC MLIRMNCoreDialect MLIRMNCoreToLLVM)`.
 
+## Layout derivation
+
+The distribution mode is identified from the linear layout's **replicated
+lane bits** (see `llvm/lib/Target/MNCore/docs/mncore_mlir_dialect.md` §8.3b):
+all six = Broadcast (l1bmp), bits 2..5 = MAB (l1bmm), bits 2..3 = MAB4
+(l1bmm4), none = Distributed (two-plane l1bmd). Element order (strided,
+contiguous, plane-major) is not part of the criterion. Blocked layouts
+express Distributed and (degenerate) MAB; MAB4/Broadcast need `#ttg.linear`.
+
+`tests/run_frontend.py` drives the real Triton frontend (TTIR/TTGIR) and
+checks both the legalizer diagnostic and the MAB-aware fixtures end-to-end.
+
 ## Known risks
 
 * Triton 3.9's MLIR/LLVM API surface against LLVM 24 is untested.
@@ -72,6 +84,8 @@ directory.
   `W/2` and `W/2+4`; the L1BM layout must place the low plane at 64
   longwords and the high plane immediately after it. `l1bmm`/`l1bmm4`
   require a future MAB-aware encoding (not derivable from Triton layouts).
-* `ttg.local_store` distributed is wired: two `l1bmd` collect transfers write
-  the low/high longword planes. The 2-longword PE operand layout is
-  `W/2` and `W/2+4`. MAB/MAB4 stores are not derivable from Triton layouts.
+* `ttg.local_store` distributed is **not numerically closed**: one `l1bmd`
+  collect per plane captures only one MAB (4 lanes); a full 64-PE writeback
+  needs 16 `mabdiff`-rotated collects (4-lane step) and the L1BM subset
+  layout (SDM §3.6.8.21/§3.7). `run_e2e_add.py` uses varied inputs and fails
+  the multiset check until this is implemented; constant inputs hide it. MAB/MAB4 stores are not derivable from Triton layouts.

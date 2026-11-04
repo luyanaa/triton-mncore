@@ -78,6 +78,10 @@ class MncoreBackend(BaseBackend):
     def get_module_map(self):
         return {}
 
+    def get_codegen_implementation(self, options):
+        # No libdevice/extra codegen functions yet.
+        return {}
+
     # ------------------------------------------------------------------
     # Stages
     # ------------------------------------------------------------------
