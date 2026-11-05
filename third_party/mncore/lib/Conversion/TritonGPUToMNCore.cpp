@@ -155,6 +155,88 @@ static bool matchFullTile(Value ptr, Value &baseArg, int64_t &N) {
   return isa<BlockArgument>(baseArg);
 }
 
+//===----------------------------------------------------------------------===//
+// tt.dot
+//===----------------------------------------------------------------------===//
+//
+// The MAU has no matrix-matrix product. SDM 3.6.9.1 (p.111) lists exactly two
+// matrix forms, mfma and mmul (mfma with y forced to 0), and each takes one
+// matrix face plus PE-memory vectors. For f32, 3.6.9.4 (p.114) defines one
+// fmfma as, per MAB,
+//
+//   dst[i] = sum(j=0..3) A[i][2j] * x[j] + y[i],   i = 0..7
+//
+// where A is the 8x8 logical single-precision face (only the even logical
+// columns 0,2,4,6 are used, so the effective matrix is 8x4), x is 4 f32 at
+// *word* width (one element per PE of the MAB), and y/dst are 8 f32 at
+// *longword* width (two per PE). The instruction drives 4 cycles with the same
+// A and a cycle-dependent x/y/dst address, so four B columns can be consumed
+// per instruction -- the 8x4-by-4x4 block is emergent from the per-cycle
+// pseudocode, not a documented matrix-matrix operation.
+//
+// A kernel-level GEMM is therefore mwrite(A) then one fmfma per 4 columns of
+// B per 8-row M block, chaining K in blocks of 4 through y. Nothing of that
+// sequence exists yet, and the TTGIR a `tl.dot` produces today cannot feed it:
+// with a blocked parent, `fmaDotToLinearLayout` puts the whole K dimension in
+// every thread's registers (32 f32 per thread for a 32x32x32 dot), while the
+// MAU consumes K one element per PE. Every dot is rejected; the function only
+// chooses which clause of the contract to cite, so the diagnostic stays
+// actionable instead of degrading to "unsupported operation".
+static LogicalResult rejectDot(triton::DotOp dot) {
+  auto aTy = dyn_cast<RankedTensorType>(dot.getA().getType());
+  auto bTy = dyn_cast<RankedTensorType>(dot.getB().getType());
+  auto cTy = dyn_cast<RankedTensorType>(dot.getC().getType());
+  if (!aTy || !bTy || !cTy || aTy.getRank() != 2 || bTy.getRank() != 2 ||
+      cTy.getRank() != 2)
+    return dot.emitError()
+           << "tt.dot on MN-Core requires rank-2 A/B/C tensors";
+
+  // Precision: the fmfma contract above is f32. The other MAU precisions have
+  // different shapes and are not wired (h = 16x16 f16 with single-precision
+  // accumulation, 3.6.9.6; d = 4x4 f64 with the u|d row half-select, 3.6.9.2).
+  Type element = cTy.getElementType();
+  if (!element.isF32() || !aTy.getElementType().isF32() ||
+      !bTy.getElementType().isF32())
+    return dot.emitError()
+           << "tt.dot on MN-Core is f32 only: the implemented MAU form is "
+              "fmfma (SDM 3.6.9.4), an 8x4-by-4 block with K=4. "
+           << element
+           << " would need the h (hmfma, 16x16 f16 with single-precision "
+              "accumulate, 3.6.9.6) or d (dmfma with the u|d row half-select, "
+              "4x4 f64, 3.6.9.2) form, neither of which is wired";
+  if (dot.getInputPrecision() != triton::InputPrecision::IEEE ||
+      dot.getMaxNumImpreciseAcc() != 0)
+    return dot.emitError()
+           << "tt.dot on MN-Core is ieee only: the MAU has no reduced-"
+              "precision input mode, and TF32/FP8 operand modes do not exist";
+
+  // Tiling: the matrix face covers 8 rows (M) and fmfma covers 4 B columns (N)
+  // and K=4 per pass, all per MAB.
+  int64_t M = cTy.getShape()[0], N = cTy.getShape()[1], K = aTy.getShape()[1];
+  if (M % 8 != 0 || N % 4 != 0 || K % 4 != 0)
+    return dot.emitError()
+           << "tt.dot " << M << "x" << K << "x" << N
+           << " does not tile the MAU: the matrix face is 8 rows (M) and one "
+              "fmfma covers 4 columns of B (N) and 4 of K, so M, N and K must "
+              "be multiples of 8, 4 and 4";
+
+  auto aLayout = aTy.getEncoding();
+  auto bLayout = bTy.getEncoding();
+  return dot.emitError()
+         << "tt.dot " << M << "x" << K << "x" << N
+         << " is not lowered yet; the MAU GEMM sequence is pending. A block "
+            "is: mwrite the 8x4 A tile into a matrix face, then one fmfma per "
+            "4 columns of B with x at word width (4 f32, one per PE) and "
+            "y/dst at longword width (8 f32, two per PE), chaining K in "
+            "blocks of 4 through y (mncore_intrinsics_design.md section 22). "
+            "This dot carries A: "
+         << aLayout << ", B: " << bLayout
+         << "; the blocked-parent dot-operand layout replicates the whole K "
+            "dimension into every thread's registers, whereas the MAU "
+            "consumes K one element per PE of a MAB, so the operands must be "
+            "given an mncore dot layout first";
+}
+
 static LogicalResult convertFunction(triton::FuncOp fn) {
   if (fn.isExternal())
     return success();
@@ -168,18 +250,28 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
   if (!fn.getFunctionType().getResults().empty())
     return fn.emitError() << "kernel must return void";
 
+  // A dot is rejected before the linear walk: the contract is a property of
+  // the whole kernel (operand layout, K distribution), so citing it is more
+  // useful than letting the walk fail on some earlier op.
+  for (Operation &op : fn.getBody().front())
+    if (auto dot = dyn_cast<triton::DotOp>(op))
+      return rejectDot(dot);
+
   SmallVector<Type> args;
-  DenseMap<Value, uint64_t> ptrBases;
+  // Buffer arguments are not resolved to DRAM addresses here: the .vsm
+  // address field is a static immediate, so each use becomes a placeholder 0
+  // plus a relocation record naming the argument (mncore_kernel_abi_v1.md
+  // §13). The loader binds the argument to a device DRAM base at run time.
+  DenseMap<Value, unsigned> ptrArgs;
   uint64_t argIndex = 0;
   for (Type t : fn.getFunctionType().getInputs()) {
     if (auto vec = convertTensorType(t); succeeded(vec)) {
       args.push_back(*vec);
     } else if (auto ptr = dyn_cast<triton::PointerType>(t);
                ptr && ptr.getPointeeType().isF32()) {
-      // DRAM buffer base, in longwords. The prototype uses a fixed tile
-      // stride; the loader/relocation pass will replace these bases.
       args.push_back(IntegerType::get(ctx, 64));
-      ptrBases[fn.getBody().front().getArgument(argIndex)] = argIndex * 128;
+      ptrArgs[fn.getBody().front().getArgument(argIndex)] =
+          (unsigned)argIndex;
     } else {
       return fn.emitError()
              << "unsupported kernel argument type " << t
@@ -344,8 +436,8 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         return load.emitError()
                << "tt.load must be `base_ptr + tl.arange(0, N)` over a whole "
                   "tile; dynamic or partial addressing is rejected";
-      auto itb = ptrBases.find(baseArg);
-      if (itb == ptrBases.end())
+      auto itb = ptrArgs.find(baseArg);
+      if (itb == ptrArgs.end())
         return load.emitError() << "load base is not a kernel buffer argument";
       auto rt = dyn_cast<RankedTensorType>(load.getType());
       if (!rt || !rt.getElementType().isF32() || N != 256)
@@ -357,13 +449,15 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       nextL1 = l1 + 2 * planeWords;
       uint64_t l2 = llvm::alignTo(nextL2, 64);
       nextL2 = l2 + 2 * planeWords;
-      uint64_t base = itb->second;
+      unsigned arg = itb->second;
       Location lloc = load.getLoc();
-      mncore::DmaOp::create(body, lloc, /*src_space=*/1u, base, l2, l1,
-                            planeWords, nextTag++, 0u);
-      mncore::DmaOp::create(body, lloc, /*src_space=*/1u, base + planeWords,
-                            l2 + planeWords, l1 + planeWords, planeWords,
-                            nextTag++, 0u);
+      mncore::DmaOp::create(body, lloc, /*src_space=*/1u, /*src_addr=*/0, l2,
+                            l1, planeWords, nextTag++, 0u,
+                            /*src_arg=*/arg);
+      mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
+                            /*src_addr=*/planeWords, l2 + planeWords,
+                            l1 + planeWords, planeWords, nextTag++, 0u,
+                            /*src_arg=*/arg);
       // The MV/L2B transfers are asynchronous; the PE read must not share a
       // step with them. Two empty steps are required before the L1B read
       // (measured on assemble3's hazard checker: one is rejected).
@@ -390,8 +484,8 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         return store.emitError()
                << "tt.store must be `base_ptr + tl.arange(0, N)` over a whole "
                   "tile; dynamic or partial addressing is rejected";
-      auto itb = ptrBases.find(baseArg);
-      if (itb == ptrBases.end())
+      auto itb = ptrArgs.find(baseArg);
+      if (itb == ptrArgs.end())
         return store.emitError() << "store base is not a kernel buffer argument";
       auto val = map.find(store.getValue());
       if (val == map.end())
@@ -404,7 +498,7 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       nextL1 = l1 + 2 * planeWords;
       uint64_t l2 = llvm::alignTo(nextL2, 64);
       nextL2 = l2 + 2 * planeWords;
-      uint64_t base = itb->second;
+      unsigned arg = itb->second;
       Location sloc = store.getLoc();
       auto tokenType = mncore::TokenType::get(ctx);
       auto lo = mncore::LbOpOp::create(body, sloc, tokenType, 0u, l1, 1u, 0u);
@@ -414,11 +508,13 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
                                  mncore::L1Mode::Distributed, lo, hi, 0);
       // Separate the PE collect from the L2B collect that reads L1BM.
       mncore::FenceOp::create(body, sloc);
-      mncore::DmaStoreOp::create(body, sloc, l1, l2, base, planeWords,
-                                 nextTag++);
+      mncore::DmaStoreOp::create(body, sloc, l1, l2, /*dr_addr=*/0,
+                                 planeWords, nextTag++, /*l1b=*/0,
+                                 /*dr_arg=*/arg);
       mncore::DmaStoreOp::create(body, sloc, l1 + planeWords,
-                                 l2 + planeWords, base + planeWords,
-                                 planeWords, nextTag++);
+                                 l2 + planeWords, /*dr_addr=*/planeWords,
+                                 planeWords, nextTag++, /*l1b=*/0,
+                                 /*dr_arg=*/arg);
       continue;
     }
 
@@ -440,11 +536,21 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         return store.emitError()
                << "a broadcast store is not defined; use a full 64-PE "
                   "distribution";
-      if (dist->kind == Distribution::MAB ||
-          dist->kind == Distribution::MAB4)
+      if (dist->kind == Distribution::MAB)
         return store.emitError()
-               << "MAB/MAB4 stores need a mabset (l1bmm@/l1bmm4@) derived "
-                  "from the source linear layout; not implemented yet";
+               << "MAB store is not derivable from a Triton layout: l1bmm@"
+                  "<mabadr> needs a physical MAB selector (0..15) that a "
+                  "replicated layout does not determine, and one transfer "
+                  "writes a single PE's double-longword operand, not the "
+                  "4-PE MAB lane. Emit an explicit mncore.vec.store with the "
+                  "selector instead";
+      if (dist->kind == Distribution::MAB4)
+        return store.emitError()
+               << "MAB4 store is not expressible: l1bmm4@<k> writes exactly "
+                  "one of the four MAB groups, the groups hold different data "
+                  "(lane bit 4 / warp select the group), and "
+                  "mncore.vec.store carries a single value token, so the four "
+                  "per-group sources cannot be written";
       // Distributed writeback: l1bmd has no double-longword form, so the two
       // longword planes are separate collect transfers.
       auto tokenType = mncore::TokenType::get(ctx);

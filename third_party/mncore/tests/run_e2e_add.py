@@ -5,9 +5,9 @@
   LLVM IR -> .vsm -> assemble3 (hazard checker) -> gpfn3 -> DRAM dump
   -> compare every output longword with the CPU golden.
 
-The host uses the compiler's canonical plane-major physical order for A/B/C;
-because the kernel is elementwise, any consistent permutation is valid and
-the golden is computed in the same order.
+The host uses the compiler's canonical plane-major physical order for A/B/C
+and compares element for element; any permutation is a writeback bug, so the
+check is deliberately stronger than a multiset comparison.
 
 Environment: MNRT_HOST (default suzhou), ASSEMBLE3, GPFN3, TRITON_BUILD_DIR,
 LLVM_BIN. Requires ssh access to the emulator host.
@@ -26,6 +26,8 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 from triton.backends.mncore.compiler import MncoreBackend
 from triton.compiler.compiler import ASTSource
+
+import mncore_fixup
 
 HERE = pathlib.Path(__file__).resolve().parent
 BUILD = pathlib.Path(os.environ.get(
@@ -106,9 +108,20 @@ def vsm_from_ttgir(text: str) -> str:
     if r4.returncode != 0:
         raise RuntimeError("llc: " + r4.stderr[:500])
     lines = []
+    in_sidecar = False
     for line in r4.stdout.splitlines():
         s = line.strip()
-        if not s or s.startswith(".") or s.startswith("#"):
+        if not s or s.startswith("."):
+            continue
+        if s.startswith("#"):
+            # Keep the per-line fixup comments and the whole sidecar block
+            # (whose entry lines do not themselves mention "@mncore.fixup").
+            if "@mncore.fixup.begin" in s:
+                in_sidecar = True
+            if in_sidecar or "@mncore.fixup" in s:
+                lines.append(s)
+            if "@mncore.fixup.end" in s:
+                in_sidecar = False
             continue
         if s.endswith(":") or s.split()[0].endswith(":"):
             continue  # drop labels/directives
@@ -133,6 +146,30 @@ def main() -> int:
         preload.append(dset_dram(BASE_B + j, b))
 
     vsm = vsm_from_ttgir(ttgir())
+    # Instruction-level guard for the writeback path. `l2bmd` (collect) builds
+    # L2BM from 8-longword chunks taken from all eight L1Bs; a Triton
+    # distributed tile is replicated, so the collect interleaves eight
+    # identical copies and destroys the plane. The store must use the
+    # single-L1B point transfer `l2bm@<l1b>` instead.
+    if "l2bm@0 " not in vsm or "l2bmd " in vsm:
+        print("E2E FAIL: writeback is not using l2bm@<l1b> point transfers\n"
+              + vsm, file=sys.stderr)
+        return 1
+    # The kernel's three buffer arguments are relocatable: every DRAM operand
+    # is a placeholder 0 plus a fixup record. This host acts as the loader and
+    # binds arg i to the DRAM base the golden data was preloaded at
+    # (kernel ABI §13.3), which also exercises the artifact the runtime will
+    # consume.
+    bindings = {0: BASE_A * 8, 1: BASE_B * 8, 2: BASE_C * 8}
+    try:
+        vsm, applied = mncore_fixup.relocate(vsm, bindings)
+    except mncore_fixup.RelocError as e:
+        print(f"E2E FAIL: relocation: {e}\n{vsm}", file=sys.stderr)
+        return 1
+    if len(applied) != 6:
+        print(f"E2E FAIL: expected 6 relocated operands (2 loads + 1 store, "
+              f"two longword planes each), got {len(applied)}", file=sys.stderr)
+        return 1
     body = "\n".join(preload) + "\n" + vsm + \
         f"d get $d{BASE_C} {2 * PLANE_LONGWORDS}\n"
 
@@ -164,10 +201,10 @@ def main() -> int:
     dump = run(["ssh", "-o", "BatchMode=yes", HOST,
                 "cat /tmp/mncore_e2e_add.dmp"]).stdout
     import re
-    # The dump exposes the physical DRAM order, which the emulator interleaves
-    # across its four groups (n0..n3). Compare each group as a multiset against
-    # the CPU golden with *distinct* inputs: a duplicated, lost, or
-    # mis-paired element changes the multiset.
+    # The dump exposes the physical DRAM order, which the emulator replicates
+    # across its four groups (n0..n3). Each group must match the CPU golden
+    # *element for element*: a multiset-only check would accept a permuted
+    # writeback, which is exactly the failure this test exists to catch.
     groups = {}
     for m in re.finditer(
             r"DEBUG-DRAM\((n\d+),(\d+)\):.*?v:(0x[0-9a-fA-F]+)\) #d get \$d256 128",
@@ -177,19 +214,15 @@ def main() -> int:
         print(f"E2E FAIL: expected 4 groups of {len(golden)} values, got "
               f"{ {k: len(v) for k, v in groups.items()} }", file=sys.stderr)
         return 1
-    want = sorted(golden)
     for g, vals in sorted(groups.items()):
-        if sorted(vals) != want:
-            bad = next((i for i, (a, b) in enumerate(zip(sorted(vals), want))
-                        if a != b), None)
-            print(f"E2E FAIL: group {g} multiset differs at sorted index {bad}: "
-                  f"{sorted(vals)[bad]:#x} vs {want[bad]:#x}", file=sys.stderr)
+        bad = next((i for i, (a, b) in enumerate(zip(vals, golden)) if a != b),
+                   None)
+        if bad is not None:
+            print(f"E2E FAIL: group {g} differs at index {bad}: "
+                  f"{vals[bad]:#x} vs {golden[bad]:#x}", file=sys.stderr)
             return 1
-    # Report the physical permutation for the first group (calibration data).
-    index_of = {v: i for i, v in enumerate(golden)}
-    perm = [index_of[v] for v in groups[sorted(groups)[0]]]
-    print(f"E2E ADD OK: 4x{len(golden)} DRAM longwords match the CPU golden; "
-          f"physical order is a permutation (first 16: {perm[:16]})")
+    print(f"E2E ADD OK: 4x{len(golden)} DRAM longwords match the CPU golden "
+          f"element for element (physical order = logical order)")
     return 0
 
 

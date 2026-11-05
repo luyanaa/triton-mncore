@@ -25,6 +25,15 @@ class MncoreOptions:
     num_stages: int = 1
     debug: bool = False
     backend_name: str = "mncore"
+    arch: str = "mncore2"
+    # The MAU is a plain IEEE f32 matrix unit: there is no tensor-core
+    # reduced-precision mode, so `ieee` is the only input precision. The
+    # frontend reads these fields from `tl.dot`'s semantic routine.
+    sanitize_overflow: bool = True
+    allowed_dot_input_precisions: tuple = ("ieee",)
+    default_dot_input_precision: str = "ieee"
+    max_num_imprecise_acc_default: int = 0
+    deprecated_fp8_dot_operand_dtypes: tuple = ()
 
     def hash(self) -> str:
         key = "_".join(f"{f.name}-{getattr(self, f.name)}" for f in fields(self))
@@ -79,8 +88,11 @@ class MncoreBackend(BaseBackend):
         return {}
 
     def get_codegen_implementation(self, options):
-        # No libdevice/extra codegen functions yet.
-        return {}
+        # No libdevice/extra codegen functions yet. The frontend still needs
+        # a `min_dot_size` hook to accept `tl.dot` at all; (1, 1, 1) defers
+        # the shape contract to `tritongpu-to-mncore`, which rejects every
+        # shape it cannot map to the 4-wide MAU exactly.
+        return {"min_dot_size": lambda lhs_type, rhs_type: (1, 1, 1)}
 
     # ------------------------------------------------------------------
     # Stages

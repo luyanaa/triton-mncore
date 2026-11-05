@@ -3,9 +3,9 @@
 
   1. Drive the real Triton frontend (ASTSource -> TTIR -> TTGIR) on an
      elementwise add kernel.
-  2. Run `tritongpu-to-mncore` on that TTGIR and assert it reaches the
-     legalizer and rejects pointer args with the expected diagnostic
-     (DRAM/buffer descriptors are not implemented yet).
+  2. Run `tritongpu-to-mncore` on that TTGIR and assert the full add kernel
+     lowers to `.vsm`: pointer args -> two-plane DMA (`l2bmb`), a distributed
+     `l1bmd` load and an `l2bm@0` point-transfer writeback.
   3. Lower the MAB-aware TTGIR fixtures (Broadcast/MAB/MAB4) end-to-end to
      .vsm and assert the physical L1BM instruction (l1bmp/l1bmm/l1bmm4).
 
@@ -63,13 +63,9 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def lower_fixture(name, expect):
-    p = HERE / name
-    r = run([str(TRITON_OPT), str(p), "--tritongpu-to-mncore"])
-    if r.returncode != 0:
-        return f"{name}: tritongpu-to-mncore failed: {r.stderr[:300]}"
+def lower_text(name, text, expects):
     with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as f:
-        f.write(r.stdout)
+        f.write(text)
         mnir = f.name
     r2 = run([str(LLVM / "mlir-opt"), mnir, "--convert-mncore-to-llvm"])
     if r2.returncode != 0:
@@ -86,9 +82,19 @@ def lower_fixture(name, expect):
     r4 = run([str(LLVM / "llc"), "-mtriple=mncore2", llfile, "-o", "-"])
     if r4.returncode != 0:
         return f"{name}: llc failed: {r4.stderr[:300]}"
-    if expect not in r4.stdout:
-        return f"{name}: expected '{expect}' in .vsm, got: {r4.stdout[:300]}"
+    missing = [e for e in expects if e not in r4.stdout]
+    if missing:
+        return (f"{name}: expected {missing} in .vsm, got: "
+                f"{r4.stdout[:300]}")
     return None
+
+
+def lower_fixture(name, expect):
+    p = HERE / name
+    r = run([str(TRITON_OPT), str(p), "--tritongpu-to-mncore"])
+    if r.returncode != 0:
+        return f"{name}: tritongpu-to-mncore failed: {r.stderr[:300]}"
+    return lower_text(name, r.stdout, [expect])
 
 
 def main() -> int:
@@ -102,12 +108,19 @@ def main() -> int:
             f.write(ttgir)
             path = f.name
         r = run([str(TRITON_OPT), path, "--tritongpu-to-mncore"])
-        if r.returncode == 0:
-            failures.append("mncore pass unexpectedly accepted pointer args")
-        elif "unsupported kernel argument type '!tt.ptr" not in r.stderr:
-            failures.append("missing pointer-arg diagnostic: " + r.stderr[:300])
+        if r.returncode != 0:
+            failures.append("tritongpu-to-mncore rejected the add kernel: "
+                            + r.stderr[:300])
         else:
-            print("PASS  frontend TTIR/TTGIR + legalizer diagnostic")
+            # Pointer args lower to static DRAM bases + two-plane DMA, a
+            # distributed l1bmd load, and an l2bm@ point-transfer writeback.
+            err = lower_text("add-kernel", r.stdout,
+                             ["l2bmb ", "l1bmd ", "l2bm@0 "])
+            if err:
+                failures.append(err)
+            else:
+                print("PASS  frontend TTIR/TTGIR + DMA + l1bmd/l2bm@ @" +
+                      ".vsm")
 
     for name, expect in [
         ("t7_broadcast.mlir", "l1bmp"),
