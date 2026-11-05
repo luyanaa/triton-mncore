@@ -114,11 +114,13 @@ def vsm_from_ttgir(text: str) -> str:
         if not s or s.startswith("."):
             continue
         if s.startswith("#"):
-            # Keep the per-line fixup comments and the whole sidecar block
-            # (whose entry lines do not themselves mention "@mncore.fixup").
+            # Keep the per-line fixup comments, the kernel entry markers (the
+            # fixup primary key is (kernel entry, site)), and the whole
+            # sidecar block (whose entry lines do not themselves mention
+            # "@mncore.fixup").
             if "@mncore.fixup.begin" in s:
                 in_sidecar = True
-            if in_sidecar or "@mncore.fixup" in s:
+            if in_sidecar or "@mncore.fixup" in s or "@mncore.kernel" in s:
                 lines.append(s)
             if "@mncore.fixup.end" in s:
                 in_sidecar = False
