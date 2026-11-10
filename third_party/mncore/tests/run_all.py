@@ -12,11 +12,13 @@ Stages:
   T7  Broadcast  -> l1bmp  (mode 0)
   T8  MAB/MAB4 store non-derivability
   T9  tt.dot / GEMM contract
+  T10 rank-2 (2-D) Distributed tile
   R   relocation contract (§13.3/§13.5)      (run_reloc.py)
   F   Triton frontend regression             (run_frontend.py)
 
-`run_e2e_add.py` needs ssh to the emulator host and a working assemble3/gpfn3,
-so it stays opt-in (`--remote`).
+`run_e2e_add.py`, `run_e2e_add2d.py` and `run_e2e_mnrt.py` need ssh to the
+emulator host and a working assemble3/gpfn3 (the last one also a built
+libmnrt), so they stay opt-in (`--remote`).
 
 Usage:
   PYTHONPATH=python python run_all.py [--remote]
@@ -40,6 +42,7 @@ STAGES = [
     ("T7", ["run_t7.py", "t7_broadcast.mlir"]),
     ("T8", ["run_t8.py"]),
     ("T9", ["run_t9.py"]),
+    ("T10", ["run_t10.py"]),
     ("R", ["run_reloc.py"]),
     ("F", ["run_frontend.py"]),
 ]
@@ -85,12 +88,15 @@ def main() -> int:
                 print(f"PASS  {label}  {verdict}")
 
     if "--remote" in sys.argv:
-        r = run([PY, "run_e2e_add.py"], HERE, env)
-        if r.returncode != 0:
-            failures.append(("E2E", (r.stdout + r.stderr)[-1500:]))
-            print("FAIL  E2E")
-        else:
-            print("PASS  E2E  " + r.stdout.strip())
+        for label, script in (("E2E", "run_e2e_add.py"),
+                              ("E2E2D", "run_e2e_add2d.py"),
+                              ("MNRT", "run_e2e_mnrt.py")):
+            r = run([PY, script], HERE, env)
+            if r.returncode != 0:
+                failures.append((label, (r.stdout + r.stderr)[-1500:]))
+                print(f"FAIL  {label}")
+            else:
+                print("PASS  " + r.stdout.strip().splitlines()[-1])
 
     if failures:
         for label, out in failures:

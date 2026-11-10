@@ -3,15 +3,17 @@
 This directory is the Triton-side adapter for the `mncore` dialect and the
 MN-Core 2 LLVM backend that live in `/Users/yanlu/Documents/llvm-mncore`.
 
-Status (2026-11-04): **M1 elementwise path closed on the emulator, with
+Status (2026-11-05): **M1 elementwise path closed on the emulator, with
 relocatable buffer arguments, and the whole suite behind one entry point**
-(`tests/run_all.py`; 13 stages, `--remote` adds the emulator E2E). The
+(`tests/run_all.py`; 14 stages, `--remote` adds the two emulator E2Es). The
 Python stage table, the two C++ passes (`tritongpu-to-mncore`, and the
 `convert-mncore-to-llvm` wrapper), and the LLVM backend are wired; a real
 `@triton.jit` vector-add kernel runs through `assemble3` + `gpfn3` and matches
-the CPU golden (`tests/run_e2e_add.py`). `tl.dot` reaches TTGIR (T9) and is
-fail-closed at the MAU contract; the GEMM lowering is pending the MAU matrix
-numeric golden.
+the CPU golden (`tests/run_e2e_add.py`), and so does a two-tile rank-2 kernel
+(`tests/run_e2e_add2d.py`). `tl.dot` reaches TTGIR (T9) and is fail-closed at
+the MAU contract; the GEMM lowering is pending the MAU matrix numeric golden,
+and a TTGIR-level MAU dot layout is not expressible in this Triton version at
+all (see the `tt.dot` bullet below and design doc §22.16.5).
 
 Run everything (after rebuilding `libtriton.so` into `python/triton/_C/`):
 
@@ -19,6 +21,14 @@ Run everything (after rebuilding `libtriton.so` into `python/triton/_C/`):
 cd third_party/mncore/tests
 PYTHONPATH=../../../../triton-mncore/python python run_all.py [--remote]
 ```
+
+`--remote` adds three end-to-end stages: the 1-D add, the two-tile rank-2
+kernel, and `run_e2e_mnrt.py`, which executes the *same* two-tile program
+through `libmnrt` (`mnrt_load_program` -> `mnrt_enqueue` -> `MNRT_DUMP`
+readback) instead of driving assemble3/gpfn3 directly, and compares the same
+CPU golden. See design doc §22.18 for what that does and does not prove (the
+libmnrt own-renderer path is currently unusable for llc output — its shape
+table is keyed differently from what its renderer looks up).
 
 ## Contract
 
@@ -120,6 +130,25 @@ E2E).
   and destroyed the plane. Writeback now uses `l2bm@<l1b>` (single-L1B point
   transfer, §3.6.7.5) on L1B 0: one contiguous 64-longword stream per plane.
   `l2bmd` remains the correct primitive only once L1Bs hold disjoint data.
+* The **global tile path is rank-agnostic**: a `tensor<16x16xf32>` tile and
+  its 256-element 1-D flattening produce the same `mncore.*` stream, because
+  the distribution criterion counts replicated lane bits and total elements,
+  never the rank (`tests/run_t10.py` asserts the two lowerings are string-
+  equal). Pointer tiles are evaluated symbolically, so whatever tree TTGIR
+  builds for `rm[:, None] * C + rn[None, :]` is accepted as long as the
+  offsets are exactly 0..N-1 from a buffer argument.
+* **Multi-tile** kernels get one DMA pair / L1BM window / writeback per tile
+  and are numerically closed on gpfn3 (`tests/run_e2e_add2d.py`: two 16x16
+  tiles, 1024 longwords compared element for element). Two constraints found
+  on the way: a writeback (`l2bm@`) and a *following* tile's DMA load share
+  the L2BM local port and need **two** nop steps of separation -- assemble3
+  aborts with `A L2BM_Local memory port is unavailable` otherwise, and one
+  nop is not enough, so the pass emits two fences before any load that
+  follows a writeback; and each tile's offsets must be 0..N-1 from *its own*
+  buffer argument (`base_ptr + N` as a second tile is rejected).
+* **Masks are rejected**, with the reason on the `tt.load`/`tt.store`: the
+  whole tile moves with one DMA descriptor and one `l1bmd`, and `vec.*`
+  `wmask`/`zmask` select operand lanes (4 f32 per PE), not tile elements.
 * MAB/MAB4 **stores** are rejected by construction, and the rejection is
   pinned by `tests/run_t8.py` (`t8_mab_store_reject.mlir`,
   `t8_mab4_store_reject.mlir`): `l1bmm@<mabadr>` needs a physical MAB
@@ -139,4 +168,9 @@ E2E).
   dimension into registers while the MAU consumes K one element per PE.
   Nothing here is lowered until the MAU matrix primitives have a numeric
   golden on gpfn3; see `mncore_intrinsics_design.md` 22 for the geometry and
-  the open width question.
+  the open width question. **A TTGIR-level MAU dot is additionally not
+  expressible**: `tt.dot` requires `#ttg.dot_op` for A/B, and `dot_op`
+  accepts only blocked/mma parents, so `#ttg.dot_op<{parent = #linear}>`
+  fails verification. Lowering `tl.dot` therefore has to happen at TTIR
+  (before layout assignment) or with a Triton verifier patch; design doc
+  §22.16.5 records the three measured rejections.

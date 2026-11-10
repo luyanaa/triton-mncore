@@ -48,9 +48,18 @@ struct DistributionInfo {
 // This is exactly SDM 3.6.8: l1bmm repeats the 4 PE values across all 16 MABs,
 // l1bmm4 shares them across groups of 4 MABs, and l1bmd gives every PE a
 // distinct value. Anything else is rejected rather than silently replicated.
+//
+// Rank: the criterion is rank-agnostic. A rank-2 (or higher) tile is accepted
+// iff its linear layout has the same replicated-bit structure; the *logical*
+// element order of the tensor -- row-major over its shape -- is then the
+// physical order the DMA path uses. That is a contract, not an accident: the
+// PE register file is a flat sequence of longwords and every L1BM transfer is
+// a flat stream, so a 2-D tile is only expressible when flattening it
+// row-major reproduces the stream. `checkFullTile` below enforces the other
+// half of it (the pointer expression must be exactly base + row-major rank).
 static FailureOr<DistributionInfo> analyzeDistribution(Type type) {
   auto tensor = dyn_cast<RankedTensorType>(type);
-  if (!tensor || tensor.getRank() != 1)
+  if (!tensor || tensor.getRank() < 1)
     return failure();
   if (!isa<ttg::DistributedEncodingTrait>(tensor.getEncoding()))
     return failure();
@@ -68,14 +77,22 @@ static FailureOr<DistributionInfo> analyzeDistribution(Type type) {
 
   auto linear = ttg::toLinearEncoding(tensor);
   auto ll = linear.getLinearLayout();
+  // A basis is one vector per input dimension; a bit is replicated when the
+  // whole vector is zero. Comparing full vectors (not just dimension 0) is
+  // what makes the test rank-independent.
   auto basesOf = [&](StringRef name) {
-    SmallVector<int32_t> out;
+    SmallVector<SmallVector<int32_t>> out;
     auto key = StringAttr::get(tensor.getContext(), name);
     auto it = ll.getBases().find(key);
     if (it == ll.getBases().end())
       return out;
-    for (const auto &basis : it->second)
-      out.push_back(basis[0]);
+    for (const auto &basis : it->second) {
+      SmallVector<int32_t> b(basis.begin(), basis.end());
+      // Multi-dim bases may be padded/truncated by the encoding; a missing
+      // dimension is a zero component.
+      b.resize(tensor.getRank(), 0);
+      out.push_back(b);
+    }
     return out;
   };
   auto reg = basesOf("register");
@@ -87,20 +104,26 @@ static FailureOr<DistributionInfo> analyzeDistribution(Type type) {
     return failure();
 
   // 64 PE lanes = 32 lane bits + 1 warp bit.
-  SmallVector<int32_t> bits;
+  SmallVector<SmallVector<int32_t>> bits;
   bits.append(lane.begin(), lane.end());
   bits.append(warp.begin(), warp.end());
   if (bits.size() > 6)
     return failure();
   // Canonicalized replicated layouts may drop the zero lane/warp bits.
-  bits.resize(6, 0);
+  bits.resize(6, SmallVector<int32_t>(tensor.getRank(), 0));
   unsigned nonzero = 0;
-  for (int32_t b : bits)
-    if (b != 0)
+  for (const auto &b : bits) {
+    bool zero = llvm::all_of(b, [](int32_t v) { return v == 0; });
+    if (!zero)
       ++nonzero;
+  }
 
-  auto isZero = [&](unsigned i) { return bits[i] == 0; };
-  int64_t elements = tensor.getShape()[0];
+  auto isZero = [&](unsigned i) {
+    return llvm::all_of(bits[i], [](int32_t v) { return v == 0; });
+  };
+  int64_t elements = 1;
+  for (int64_t d : tensor.getShape())
+    elements *= d;
   VectorType vectorType = VectorType::get({lanes}, element);
 
   Distribution kind;
@@ -135,24 +158,220 @@ static FailureOr<VectorType> convertTensorType(Type type) {
   return info->vectorType;
 }
 
-// Match `tt.addptr(tt.splat(ptr_arg), tt.make_range(0, N))`, i.e. a whole
-// contiguous tile starting at a kernel pointer argument. Only compile-time
-// affine offsets are accepted; anything else must be rejected by the caller.
+//===----------------------------------------------------------------------===//
+// Full-tile pointer matching
+//===----------------------------------------------------------------------===//
+//
+// The global-memory path accepts exactly one access shape: a whole contiguous
+// tile whose element at logical row-major index i is `base + i`, where `base`
+// is a kernel buffer argument. Only compile-time offsets are accepted.
+//
+// The offset is matched by *evaluating* it, not by pattern-matching a fixed
+// tree. TTGIR expands a natural index expression such as
+// `a_ptr + rm[:, None] * C + rn[None, :]` into make_range / expand_dims /
+// broadcast / convert_layout / addi / muli, and the exact folding differs
+// between Triton versions and between 1-D and 2-D kernels. Matching the tree
+// would make which kernels compile depend on that shape; evaluating the tensor
+// and requiring offset[i] == i accepts every spelling of the same access and
+// nothing else.
+
+struct IdxTile {
+  SmallVector<int64_t> vals; // row-major over the logical shape
+};
+
+static SmallVector<int64_t> shapeOf(Value v) {
+  auto rt = dyn_cast<RankedTensorType>(v.getType());
+  if (!rt)
+    return {};
+  return SmallVector<int64_t>(rt.getShape().begin(), rt.getShape().end());
+}
+
+static int64_t numel(ArrayRef<int64_t> shape) {
+  int64_t n = 1;
+  for (int64_t d : shape)
+    n *= d;
+  return n;
+}
+
+static SmallVector<int64_t> unravel(ArrayRef<int64_t> shape, int64_t lin) {
+  SmallVector<int64_t> idx(shape.size());
+  for (int i = (int)shape.size() - 1; i >= 0; --i) {
+    idx[i] = lin % shape[i];
+    lin /= shape[i];
+  }
+  return idx;
+}
+
+static int64_t ravel(ArrayRef<int64_t> shape, ArrayRef<int64_t> idx) {
+  int64_t lin = 0;
+  for (size_t i = 0; i < shape.size(); ++i)
+    lin = lin * shape[i] + idx[i];
+  return lin;
+}
+
+// Map a source tile onto a (possibly broadcast) destination shape.
+static std::optional<IdxTile> broadcastVals(const IdxTile &in,
+                                            ArrayRef<int64_t> srcShape,
+                                            ArrayRef<int64_t> dstShape) {
+  if (srcShape.size() != dstShape.size())
+    return std::nullopt;
+  IdxTile out;
+  int64_t n = numel(dstShape);
+  out.vals.reserve(n);
+  for (int64_t lin = 0; lin < n; ++lin) {
+    auto idx = unravel(dstShape, lin);
+    for (size_t d = 0; d < idx.size(); ++d)
+      if (srcShape[d] == 1)
+        idx[d] = 0;
+    out.vals.push_back(in.vals[ravel(srcShape, idx)]);
+  }
+  return out;
+}
+
+static std::optional<IdxTile> evalIndex(Value v, unsigned depth = 0) {
+  if (depth > 24)
+    return std::nullopt;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+
+  if (auto range = dyn_cast<triton::MakeRangeOp>(op)) {
+    IdxTile t;
+    for (int64_t i = range.getStart(); i < range.getEnd(); ++i)
+      t.vals.push_back(i);
+    return t;
+  }
+  if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
+    auto attr = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!attr || !attr.getElementType().isInteger(32))
+      return std::nullopt;
+    IdxTile t;
+    for (auto el : attr.getValues<APInt>())
+      t.vals.push_back(el.getSExtValue());
+    return t;
+  }
+  if (auto sp = dyn_cast<triton::SplatOp>(op)) {
+    auto ic = sp.getSrc().getDefiningOp<arith::ConstantOp>();
+    if (!ic)
+      return std::nullopt;
+    auto ia = dyn_cast<IntegerAttr>(ic.getValue());
+    if (!ia)
+      return std::nullopt;
+    IdxTile t;
+    t.vals.assign(numel(shapeOf(sp.getResult())), ia.getInt());
+    return t;
+  }
+  if (auto ed = dyn_cast<triton::ExpandDimsOp>(op)) {
+    // Inserting a size-1 dimension leaves the row-major value order alone.
+    return evalIndex(ed.getSrc(), depth + 1);
+  }
+  if (auto bc = dyn_cast<triton::BroadcastOp>(op)) {
+    auto in = evalIndex(bc.getSrc(), depth + 1);
+    if (!in)
+      return std::nullopt;
+    return broadcastVals(*in, shapeOf(bc.getSrc()), shapeOf(bc.getResult()));
+  }
+  if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    // A relayout permutes values between threads but not within the logical
+    // tensor, so an index tile is unchanged by it.
+    auto in = evalIndex(cl.getSrc(), depth + 1);
+    if (!in)
+      return std::nullopt;
+    if (numel(shapeOf(cl.getSrc())) != numel(shapeOf(cl.getResult())))
+      return std::nullopt;
+    return in;
+  }
+  if (isa<arith::AddIOp, arith::MulIOp>(op)) {
+    auto a = evalIndex(op->getOperand(0), depth + 1);
+    auto b = evalIndex(op->getOperand(1), depth + 1);
+    if (!a || !b || a->vals.size() != b->vals.size())
+      return std::nullopt;
+    IdxTile t;
+    for (size_t i = 0; i < a->vals.size(); ++i)
+      t.vals.push_back(isa<arith::AddIOp>(op) ? a->vals[i] + b->vals[i]
+                                              : a->vals[i] * b->vals[i]);
+    return t;
+  }
+  return std::nullopt;
+}
+
+struct PtrTile {
+  Value base;
+  SmallVector<int64_t> off;
+};
+
+static std::optional<PtrTile> evalPtrTile(Value v, unsigned depth = 0) {
+  if (depth > 24)
+    return std::nullopt;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+
+  if (auto sp = dyn_cast<triton::SplatOp>(op)) {
+    auto rt = dyn_cast<RankedTensorType>(sp.getResult().getType());
+    if (!rt || !isa<triton::PointerType>(rt.getElementType()))
+      return std::nullopt;
+    PtrTile t;
+    t.base = sp.getSrc();
+    t.off.assign(numel(rt.getShape()), 0);
+    return t;
+  }
+  if (auto ap = dyn_cast<triton::AddPtrOp>(op)) {
+    auto in = evalPtrTile(ap.getPtr(), depth + 1);
+    if (!in)
+      return std::nullopt;
+    auto idx = evalIndex(ap.getOffset());
+    if (!idx || idx->vals.size() != in->off.size())
+      return std::nullopt;
+    for (size_t i = 0; i < in->off.size(); ++i)
+      in->off[i] += idx->vals[i];
+    return in;
+  }
+  if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op))
+    return evalPtrTile(cl.getSrc(), depth + 1);
+  if (auto bc = dyn_cast<triton::BroadcastOp>(op)) {
+    auto in = evalPtrTile(bc.getSrc(), depth + 1);
+    if (!in)
+      return std::nullopt;
+    IdxTile ids;
+    ids.vals = in->off;
+    auto out = broadcastVals(ids, shapeOf(bc.getSrc()), shapeOf(bc.getResult()));
+    if (!out)
+      return std::nullopt;
+    PtrTile t;
+    t.base = in->base;
+    t.off = std::move(out->vals);
+    return t;
+  }
+  return std::nullopt;
+}
+
+// Match a whole contiguous tile: `base_ptr + <row-major 0..N-1>`.
 static bool matchFullTile(Value ptr, Value &baseArg, int64_t &N) {
-  auto add = ptr.getDefiningOp<triton::AddPtrOp>();
-  if (!add)
+  auto t = evalPtrTile(ptr);
+  if (!t || !isa<BlockArgument>(t->base))
     return false;
-  auto splat = add.getPtr().getDefiningOp<triton::SplatOp>();
-  if (!splat)
-    return false;
-  auto range = add.getOffset().getDefiningOp<triton::MakeRangeOp>();
-  if (!range || range.getStart() != 0)
-    return false;
-  N = range.getEnd();
+  N = t->off.size();
   if (N <= 0)
     return false;
-  baseArg = splat.getSrc();
-  return isa<BlockArgument>(baseArg);
+  for (int64_t i = 0; i < N; ++i)
+    if (t->off[i] != i)
+      return false;
+  baseArg = t->base;
+  return true;
+}
+
+// Ops that only compute an address or an index: their results are integers or
+// pointers, never PE data, and `matchFullTile` re-evaluates them from the
+// load/store that consumes them.
+static bool isIndexOnly(Operation *op) {
+  if (op->getNumResults() != 1)
+    return false;
+  auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!rt)
+    return false;
+  Type el = rt.getElementType();
+  return el.isIntOrIndex() || isa<triton::PointerType>(el);
 }
 
 //===----------------------------------------------------------------------===//
@@ -257,6 +476,34 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
     if (auto dot = dyn_cast<triton::DotOp>(op))
       return rejectDot(dot);
 
+  // Masking is likewise a property of the access, not of one PE: the global
+  // path moves the whole 256xf32 tile with one DMA descriptor (src_arg names
+  // the buffer, the two plane records carry the byte offsets) and reads it
+  // into each PE's slot with one distributed l1bmd. There is no per-element
+  // predicate anywhere in that path -- `vec.*` wmask/zmask select *operand
+  // lanes*, four per PE, and cannot mask an individual tile element without
+  // also masking three others. Checking here rather than in the walk keeps
+  // the diagnostic on the `tt.load`/`tt.store` even when the mask (or its
+  // `other` constant) was materialised earlier in the block.
+  for (Operation &op : fn.getBody().front()) {
+    if (auto load = dyn_cast<triton::LoadOp>(op))
+      if (load.getMask() || load.getOther())
+        return load.emitError()
+               << "masked tile loads are not lowerable: the 256xf32 global "
+                  "path moves the whole tile with one DMA descriptor and "
+                  "reads it with one distributed l1bmd, and `vec.*` masks "
+                  "select operand lanes (4 f32 per PE), not tile elements. A "
+                  "partial tile has to be expressed as a smaller whole tile "
+                  "or a scalar path";
+    if (auto store = dyn_cast<triton::StoreOp>(op))
+      if (store.getMask())
+        return store.emitError()
+               << "masked tile stores are not lowerable: the 256xf32 global "
+                  "path writes the whole tile back with two l2bm point "
+                  "transfers, and `vec.*` masks select operand lanes (4 f32 "
+                  "per PE), not tile elements";
+  }
+
   SmallVector<Type> args;
   // Buffer arguments are not resolved to DRAM addresses here: the .vsm
   // address field is a static immediate, so each use becomes a placeholder 0
@@ -275,8 +522,9 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
     } else {
       return fn.emitError()
              << "unsupported kernel argument type " << t
-             << "; expected a 1-D blocked tensor with 4xf32 / 2xf64 / 8xf16 "
-                "per PE, or an *fp32 buffer";
+             << "; expected a blocked/linear tensor with 4xf32 / 2xf64 / "
+                "8xf16 per PE (any rank, flattened row-major), or an *fp32 "
+                "buffer";
     }
     ++argIndex;
   }
@@ -301,6 +549,15 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
 
   OpBuilder body = OpBuilder::atBlockEnd(newBody);
   uint64_t nextL1 = 0;
+  // True once a tile has been written back. The writeback (`l2bm@`) and a
+  // following tile's DMA load both drive the L2BM local port, and assemble3's
+  // hazard checker rejects the load when the writeback is two steps old:
+  // "A L2BM_Local memory port is unavailable" on the first `l2bmb` after it.
+  // Measured on a two-tile kernel: two nop steps of separation assemble, one
+  // does not. Emitting the two fences here (rather than at the end of the
+  // store path) keeps them in front of the DMA no matter what the next tile
+  // starts with.
+  bool wroteBack = false;
 
   for (Operation &op : oldBody) {
     if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
@@ -331,8 +588,11 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       if (failed(dist))
         return load.emitError()
                << "local_load layout is neither a full 64-PE distribution "
-                  "(threads*warps == 64, elements == 64*lanes) nor a "
-                  "broadcast (one thread, elements == lanes)";
+                  "(64 distinct lane ids, elements == 64*lanes with lanes the "
+                  "per-PE width: 4 f32 / 2 f64 / 8 f16) nor a broadcast (one "
+                  "thread, elements == lanes). Rank does not matter, only the "
+                  "replicated lane bits and the total element count: "
+               << load.getType();
       auto tokenType = mncore::TokenType::get(ctx);
       Location loc = load.getLoc();
       Value value;
@@ -422,9 +682,44 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       continue;
     }
 
-    // Pointer expressions are consumed by the full-tile load/store patterns.
-    if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp>(op))
+    // Address and index arithmetic: `matchFullTile` re-evaluates the whole
+    // pointer expression from the load/store that consumes it, so nothing with
+    // an integer or pointer tensor type produces PE data. The backend has no
+    // integer data path at all, so dropping these is total; an address that is
+    // not compile-time (a runtime value in the chain) makes `matchFullTile`
+    // fail at the load/store with a precise diagnostic.
+    if (isIndexOnly(&op))
       continue;
+
+    // A relayout of *data* is a no-op in this model only when both sides have
+    // the same distribution: the pass never materialises a per-thread
+    // placement, it maps every tensor to the PE-wide value its distribution
+    // implies. Converting between two different distributions would need the
+    // values moved between PEs, which the PE file has no instruction for.
+    if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+      auto it = map.find(cl.getSrc());
+      if (it == map.end())
+        return cl.emitError()
+               << "convert_layout source is not an mncore vector";
+      auto src = analyzeDistribution(cl.getSrc().getType());
+      auto dst = analyzeDistribution(cl.getResult().getType());
+      if (failed(src) || failed(dst) || src->kind != dst->kind)
+        return cl.emitError()
+               << "convert_layout between different distributions is not "
+                  "expressible: the PE register file has no shuffle, so a "
+                  "relayout has to go through L1BM (local_alloc, local_store, "
+                  "local_load). Source: "
+               << cl.getSrc().getType() << ", result: " << cl.getResult().getType();
+      map[cl.getResult()] = it->second;
+      continue;
+    }
+
+    if (isa<triton::BroadcastOp, triton::ExpandDimsOp>(op))
+      return op.emitError()
+             << "replicating a value across PEs is not lowerable: the "
+                "distribution modes (l1bmp/l1bmm/l1bmm4) replicate during the "
+                "L1BM read, not in registers. Load the tile with the "
+                "replicated layout instead of broadcasting a loaded value";
 
     if (auto load = dyn_cast<triton::LoadOp>(op)) {
       if (load.getMask() || load.getOther())
@@ -434,8 +729,11 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       int64_t N = 0;
       if (!matchFullTile(load.getPtr(), baseArg, N))
         return load.emitError()
-               << "tt.load must be `base_ptr + tl.arange(0, N)` over a whole "
-                  "tile; dynamic or partial addressing is rejected";
+               << "tt.load must be a whole tile at `base_ptr` whose offsets "
+                  "are exactly the row-major index 0..N-1 (1-D "
+                  "`base_ptr + tl.arange(0, N)`, or a 2-D "
+                  "`base_ptr + rm[:, None] * C + rn[None, :]`); dynamic or "
+                  "partial addressing is rejected";
       auto itb = ptrArgs.find(baseArg);
       if (itb == ptrArgs.end())
         return load.emitError() << "load base is not a kernel buffer argument";
@@ -451,6 +749,12 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       nextL2 = l2 + 2 * planeWords;
       unsigned arg = itb->second;
       Location lloc = load.getLoc();
+      if (wroteBack) {
+        // Drain the L2BM local port between a writeback and this load (see
+        // `wroteBack`): two empty steps, which print as `nop/2`.
+        mncore::FenceOp::create(body, lloc);
+        mncore::FenceOp::create(body, lloc);
+      }
       mncore::DmaOp::create(body, lloc, /*src_space=*/1u, /*src_addr=*/0, l2,
                             l1, planeWords, nextTag++, 0u,
                             /*src_arg=*/arg);
@@ -482,8 +786,11 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       int64_t N = 0;
       if (!matchFullTile(store.getPtr(), baseArg, N))
         return store.emitError()
-               << "tt.store must be `base_ptr + tl.arange(0, N)` over a whole "
-                  "tile; dynamic or partial addressing is rejected";
+               << "tt.store must be a whole tile at `base_ptr` whose offsets "
+                  "are exactly the row-major index 0..N-1 (1-D "
+                  "`base_ptr + tl.arange(0, N)`, or a 2-D "
+                  "`base_ptr + rm[:, None] * C + rn[None, :]`); dynamic or "
+                  "partial addressing is rejected";
       auto itb = ptrArgs.find(baseArg);
       if (itb == ptrArgs.end())
         return store.emitError() << "store base is not a kernel buffer argument";
@@ -515,6 +822,7 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
                                  l2 + planeWords, /*dr_addr=*/planeWords,
                                  planeWords, nextTag++, /*l1b=*/0,
                                  /*dr_arg=*/arg);
+      wroteBack = true;
       continue;
     }
 
