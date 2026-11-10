@@ -738,15 +738,22 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       if (itb == ptrArgs.end())
         return load.emitError() << "load base is not a kernel buffer argument";
       auto rt = dyn_cast<RankedTensorType>(load.getType());
-      if (!rt || !rt.getElementType().isF32() || N != 256)
+      // Two tile widths are supported: 256xf32 (4 f32 = 2 longwords per PE,
+      // a `vec`-style value) and 512xf32 (8 f32 = 4 longwords per PE, a
+      // slab). The slab form exists because every matrix role of
+      // `mncore.gemm.tile` is 4 longwords wide.
+      unsigned perPe = rt ? (unsigned)(N / 64) : 0;
+      if (!rt || !rt.getElementType().isF32() || (perPe != 4 && perPe != 8))
         return load.emitError()
-               << "the first global-load path supports a 256xf32 tile "
-                  "(64 PEs x 4 f32)";
-      uint64_t planeWords = N / 4; // 64 longwords per plane
+               << "the global-load path supports a 256xf32 tile (4 f32 per "
+                  "PE) or a 512xf32 tile (8 f32 per PE, the matrix-role "
+                  "width)";
+      unsigned planes = perPe / 2;      // longwords per PE
+      uint64_t planeWords = 64;         // one longword per PE, per plane
       uint64_t l1 = llvm::alignTo(nextL1, 64);
-      nextL1 = l1 + 2 * planeWords;
+      nextL1 = l1 + planes * planeWords;
       uint64_t l2 = llvm::alignTo(nextL2, 64);
-      nextL2 = l2 + 2 * planeWords;
+      nextL2 = l2 + planes * planeWords;
       unsigned arg = itb->second;
       Location lloc = load.getLoc();
       if (wroteBack) {
@@ -755,25 +762,31 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         mncore::FenceOp::create(body, lloc);
         mncore::FenceOp::create(body, lloc);
       }
-      mncore::DmaOp::create(body, lloc, /*src_space=*/1u, /*src_addr=*/0, l2,
-                            l1, planeWords, nextTag++, 0u,
-                            /*src_arg=*/arg);
-      mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
-                            /*src_addr=*/planeWords, l2 + planeWords,
-                            l1 + planeWords, planeWords, nextTag++, 0u,
-                            /*src_arg=*/arg);
+      for (unsigned pl = 0; pl < planes; ++pl)
+        mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
+                              /*src_addr=*/pl * planeWords,
+                              l2 + pl * planeWords, l1 + pl * planeWords,
+                              planeWords, nextTag++, 0u, /*src_arg=*/arg);
       // The MV/L2B transfers are asynchronous; the PE read must not share a
       // step with them. Two empty steps are required before the L1B read
       // (measured on assemble3's hazard checker: one is rejected).
       mncore::FenceOp::create(body, lloc);
       mncore::FenceOp::create(body, lloc);
       auto tokenType = mncore::TokenType::get(ctx);
-      auto lo = mncore::LbOpOp::create(body, lloc, tokenType, 0u, l1, 1u, 0u);
-      auto hi = mncore::LbOpOp::create(body, lloc, tokenType, 0u,
-                                       l1 + planeWords, 1u, 0u);
-      auto value = mncore::VecLoadOp::create(
-          body, lloc, VectorType::get({4}, rt.getElementType()),
-          mncore::L1Mode::Distributed, lo, hi);
+      SmallVector<Value> tok;
+      for (unsigned pl = 0; pl < planes; ++pl)
+        tok.push_back(mncore::LbOpOp::create(body, lloc, tokenType, 0u,
+                                             l1 + pl * planeWords, 1u, 0u));
+      Value value;
+      if (perPe == 4) {
+        value = mncore::VecLoadOp::create(
+            body, lloc, VectorType::get({4}, rt.getElementType()),
+            mncore::L1Mode::Distributed, tok[0], tok[1]);
+      } else {
+        value = mncore::SlabLoadOp::create(
+            body, lloc, VectorType::get({8}, rt.getElementType()),
+            mncore::L1Mode::Distributed, tok[0], tok[1], tok[2], tok[3]);
+      }
       map[load.getResult()] = value;
       continue;
     }
@@ -797,31 +810,41 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       auto val = map.find(store.getValue());
       if (val == map.end())
         return store.emitError() << "store value is not an mncore vector";
-      if (N != 256)
+      unsigned perPe = (unsigned)(N / 64);
+      if (perPe != 4 && perPe != 8)
         return store.emitError()
-               << "the first global-store path supports a 256xf32 tile";
-      uint64_t planeWords = N / 4;
+               << "the global-store path supports a 256xf32 tile (4 f32 per "
+                  "PE) or a 512xf32 tile (8 f32 per PE, the matrix-role "
+                  "width)";
+      unsigned planes = perPe / 2;
+      uint64_t planeWords = 64;
       uint64_t l1 = llvm::alignTo(nextL1, 64);
-      nextL1 = l1 + 2 * planeWords;
+      nextL1 = l1 + planes * planeWords;
       uint64_t l2 = llvm::alignTo(nextL2, 64);
-      nextL2 = l2 + 2 * planeWords;
+      nextL2 = l2 + planes * planeWords;
       unsigned arg = itb->second;
       Location sloc = store.getLoc();
       auto tokenType = mncore::TokenType::get(ctx);
-      auto lo = mncore::LbOpOp::create(body, sloc, tokenType, 0u, l1, 1u, 0u);
-      auto hi = mncore::LbOpOp::create(body, sloc, tokenType, 0u,
-                                       l1 + planeWords, 1u, 0u);
-      mncore::VecStoreOp::create(body, sloc, val->second,
-                                 mncore::L1Mode::Distributed, lo, hi, 0);
+      SmallVector<Value> tok;
+      for (unsigned pl = 0; pl < planes; ++pl)
+        tok.push_back(mncore::LbOpOp::create(body, sloc, tokenType, 0u,
+                                             l1 + pl * planeWords, 1u, 0u));
+      if (perPe == 4) {
+        mncore::VecStoreOp::create(body, sloc, val->second,
+                                   mncore::L1Mode::Distributed, tok[0], tok[1],
+                                   0);
+      } else {
+        mncore::SlabStoreOp::create(body, sloc, val->second,
+                                    mncore::L1Mode::Distributed, tok[0],
+                                    tok[1], tok[2], tok[3], 0);
+      }
       // Separate the PE collect from the L2B collect that reads L1BM.
       mncore::FenceOp::create(body, sloc);
-      mncore::DmaStoreOp::create(body, sloc, l1, l2, /*dr_addr=*/0,
-                                 planeWords, nextTag++, /*l1b=*/0,
-                                 /*dr_arg=*/arg);
-      mncore::DmaStoreOp::create(body, sloc, l1 + planeWords,
-                                 l2 + planeWords, /*dr_addr=*/planeWords,
-                                 planeWords, nextTag++, /*l1b=*/0,
-                                 /*dr_arg=*/arg);
+      for (unsigned pl = 0; pl < planes; ++pl)
+        mncore::DmaStoreOp::create(body, sloc, l1 + pl * planeWords,
+                                   l2 + pl * planeWords,
+                                   /*dr_addr=*/pl * planeWords, planeWords,
+                                   nextTag++, /*l1b=*/0, /*dr_arg=*/arg);
       wroteBack = true;
       continue;
     }
