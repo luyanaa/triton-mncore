@@ -13,6 +13,7 @@ Stages:
   T8  MAB/MAB4 store non-derivability
   T9  tt.dot / GEMM contract
   T10 rank-2 (2-D) Distributed tile
+  T11 packed-dot landing sequence (structural; G2 open)
   R   relocation contract (§13.3/§13.5)      (run_reloc.py)
   F   Triton frontend regression             (run_frontend.py)
 
@@ -43,6 +44,7 @@ STAGES = [
     ("T8", ["run_t8.py"]),
     ("T9", ["run_t9.py"]),
     ("T10", ["run_t10.py"]),
+    ("T11", ["run_t11.py", "t11_packed_gemm.mlir"]),
     ("R", ["run_reloc.py"]),
     ("F", ["run_frontend.py"]),
 ]
