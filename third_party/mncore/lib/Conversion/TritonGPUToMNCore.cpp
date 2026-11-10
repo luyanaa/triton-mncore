@@ -401,6 +401,21 @@ static bool isIndexOnly(Operation *op) {
 // MAU consumes K one element per PE. Every dot is rejected; the function only
 // chooses which clause of the contract to cite, so the diagnostic stays
 // actionable instead of degrading to "unsupported operation".
+// The narrow packed-dot contract (design doc 22.22): A is 16 f32 per PE
+// (a_lo + a_hi), B is 4 f32 per PE pre-packed by the caller, C and the result
+// are 8 f32 per PE. B must already hold one column per PE -- the compiler
+// does not transpose, because no measured primitive can.
+static LogicalResult checkNarrowDot(triton::DotOp dot) {
+  auto shapeOk = [](Value v, int64_t n) {
+    auto t = dyn_cast<RankedTensorType>(v.getType());
+    return t && t.getElementType().isF32() && t.getNumElements() == n;
+  };
+  if (!shapeOk(dot.getA(), 1024) || !shapeOk(dot.getB(), 256) ||
+      !shapeOk(dot.getC(), 512) || !shapeOk(dot.getResult(), 512))
+    return failure();
+  return success();
+}
+
 static LogicalResult rejectDot(triton::DotOp dot) {
   auto aTy = dyn_cast<RankedTensorType>(dot.getA().getType());
   auto bTy = dyn_cast<RankedTensorType>(dot.getB().getType());
@@ -474,7 +489,8 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
   // useful than letting the walk fail on some earlier op.
   for (Operation &op : fn.getBody().front())
     if (auto dot = dyn_cast<triton::DotOp>(op))
-      return rejectDot(dot);
+      if (failed(checkNarrowDot(dot)))
+        return rejectDot(dot);
 
   // Masking is likewise a property of the access, not of one PE: the global
   // path moves the whole 256xf32 tile with one DMA descriptor (src_arg names
@@ -537,6 +553,8 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
   Block &oldBody = fn.getBody().front();
   Block *newBody = newFn.addEntryBlock();
   DenseMap<Value, Value> map;
+  // Values that occupy two slabs (a dot's A): the second one.
+  DenseMap<Value, Value> mapHi;
   struct AllocInfo {
     uint64_t base;
     uint64_t longwords;
@@ -721,6 +739,25 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
                 "L1BM read, not in registers. Load the tile with the "
                 "replicated layout instead of broadcasting a loaded value";
 
+    if (auto dot = dyn_cast<triton::DotOp>(op)) {
+      auto a = map.find(dot.getA());
+      auto ah = mapHi.find(dot.getA());
+      auto b = map.find(dot.getB());
+      auto c = map.find(dot.getC());
+      if (a == map.end() || ah == mapHi.end() || b == map.end() ||
+          c == map.end())
+        return dot.emitError()
+               << "packed dot operands must come from loaded tiles: A a "
+                  "1024xf32 tile (a_lo + a_hi), B a 256xf32 pre-packed tile, "
+                  "C a 512xf32 tile (design doc 22.22). B is not transposed "
+                  "by the compiler";
+      auto res = mncore::GemmTileOp::create(body, dot.getLoc(),
+                                            a->second.getType(), 0u, a->second,
+                                            ah->second, b->second, c->second);
+      map[dot.getResult()] = res;
+      continue;
+    }
+
     if (auto load = dyn_cast<triton::LoadOp>(op)) {
       if (load.getMask() || load.getOther())
         return load.emitError()
@@ -743,11 +780,12 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       // slab). The slab form exists because every matrix role of
       // `mncore.gemm.tile` is 4 longwords wide.
       unsigned perPe = rt ? (unsigned)(N / 64) : 0;
-      if (!rt || !rt.getElementType().isF32() || (perPe != 4 && perPe != 8))
+      if (!rt || !rt.getElementType().isF32() ||
+          (perPe != 4 && perPe != 8 && perPe != 16))
         return load.emitError()
-               << "the global-load path supports a 256xf32 tile (4 f32 per "
-                  "PE) or a 512xf32 tile (8 f32 per PE, the matrix-role "
-                  "width)";
+               << "the global-load path supports 256xf32 (4 f32 per PE), "
+                  "512xf32 (8 f32 per PE, one matrix slab) or 1024xf32 "
+                  "(16 f32 per PE, the two slabs a dot's A needs)";
       unsigned planes = perPe / 2;      // longwords per PE
       uint64_t planeWords = 64;         // one longword per PE, per plane
       uint64_t l1 = llvm::alignTo(nextL1, 64);
@@ -786,6 +824,12 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         value = mncore::SlabLoadOp::create(
             body, lloc, VectorType::get({8}, rt.getElementType()),
             mncore::L1Mode::Distributed, tok[0], tok[1], tok[2], tok[3]);
+        if (perPe == 16) {
+          // A dot's A is a_lo and a_hi: two slabs, rows 0-3 and 4-7.
+          mapHi[load.getResult()] = mncore::SlabLoadOp::create(
+              body, lloc, VectorType::get({8}, rt.getElementType()),
+              mncore::L1Mode::Distributed, tok[4], tok[5], tok[6], tok[7]);
+        }
       }
       map[load.getResult()] = value;
       continue;
