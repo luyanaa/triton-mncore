@@ -37,11 +37,11 @@ def main() -> int:
         "llvm.mncore.matvec.v4f32",    # the MAU expression
     ]
     missing = [n for n in need if n not in llir]
-    if missing or llir.count("llvm.mncore.matwrite.v8f32") != 2:
+    if missing or llir.count("llvm.mncore.matwrite.v8f32") != 4:
         print("T11 FAIL: missing " + ", ".join(missing or
-                                               ["2x matwrite"]), file=sys.stderr)
+                                               ["2 x 2 matwrite"]), file=sys.stderr)
         return 1
-    print("T11 OK: packed gemm sequence -> 2x matwrite + 1x matvec")
+    print("T11 OK: blocked gemm -> 2 blocks x (2 matwrite + 1 matvec), K chained")
     return 0
 
 

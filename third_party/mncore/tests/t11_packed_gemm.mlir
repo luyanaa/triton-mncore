@@ -15,5 +15,8 @@ tt.func @packed_gemm() {
   %b1 = "mncore.lbop"() <{mem = 0 : i32, addr = 320 : i64, width = 1 : i32, flags = 0 : i32}> : () -> !mncore.token
   %b = "mncore.vec.load"(%b0, %b1) <{mode = 3 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
   %c = "mncore.gemm.tile"(%alo, %alo, %b, %alo) <{face = 0 : i64}> : (vector<8xf32>, vector<8xf32>, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  // K chaining: the next block accumulates into the previous result, on the
+  // other face (design doc 22.28).
+  %d = "mncore.gemm.tile"(%alo, %alo, %b, %c) <{face = 1 : i64}> : (vector<8xf32>, vector<8xf32>, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
   tt.return
 }
