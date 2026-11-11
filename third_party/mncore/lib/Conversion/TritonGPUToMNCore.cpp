@@ -817,16 +817,22 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
           if (isa<triton::DotOp>(user))
             feedsDot = true;
       if (feedsDot) {
+        // fmfma reads matrix columns 0/2/4/6, and column 2q can only come from
+        // PE q's longword LOW half (fmwrite), so PE q must hold K index q:
+        // the K dimension is spread over the four PEs, one K per PE. The
+        // source A' is therefore a *padded* buffer -- one longword per
+        // (MAB, row, K) with the value in the low half -- and each transfer
+        // moves the four K longwords of one row onto offsets 4m..4m+3.
         for (unsigned m = 0; m < 16; ++m)
           for (unsigned j = 0; j < 4; ++j)
             for (unsigned half = 0; half < 2; ++half) {
-              uint64_t row = 8 * m + 4 * half + j;
+              uint64_t src = (uint64_t)half * 256 + (m * 4 + j) * 4;
               uint64_t dst = l1 + (uint64_t)half * 4 * planeWords +
                              64 * j + 4 * m;
               mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
-                                    /*src_addr=*/2 * row,
+                                    /*src_addr=*/src,
                                     /*l2_addr=*/dst, /*l1_addr=*/dst,
-                                    /*size=*/2, nextTag++, 0u,
+                                    /*size=*/4, nextTag++, 0u,
                                     /*src_arg=*/arg);
             }
       } else {
