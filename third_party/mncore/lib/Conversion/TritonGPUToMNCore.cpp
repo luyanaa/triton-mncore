@@ -401,10 +401,17 @@ static bool isIndexOnly(Operation *op) {
 // MAU consumes K one element per PE. Every dot is rejected; the function only
 // chooses which clause of the contract to cite, so the diagnostic stays
 // actionable instead of degrading to "unsupported operation".
-// The narrow packed-dot contract (design doc 22.22): A is 16 f32 per PE
-// (a_lo + a_hi), B is 4 f32 per PE pre-packed by the caller, C and the result
-// are 8 f32 per PE. B must already hold one column per PE -- the compiler
-// does not transpose, because no measured primitive can.
+// The blocked-GEMM contract (design doc 22.30): A is 16 f32 per PE (a_lo +
+// a_hi, placed into the face slots by 128 small DMAs), B is 4 f32 per PE from
+// a buffer written at deployment time in x layout (plane p, longword q =
+// B[2p][q%N], B[2p+1][q%N], replicated per MAB), and C is 8 f32 per PE, which
+// is exactly a slab, so the ordinary store path carries it back.
+//
+// The compiler checks shapes and pointer provenance only; it does not
+// transpose and does not inspect the buffer, because no measured primitive
+// can produce a per-PE column assignment. A buffer that violates the layout
+// contract yields wrong numbers -- that is the caller's contract, stated in
+// 22.30 like the whole-tile and 0..N-1 offset rules.
 static LogicalResult checkNarrowDot(triton::DotOp dot) {
   auto shapeOk = [](Value v, int64_t n) {
     auto t = dyn_cast<RankedTensorType>(v.getType());
