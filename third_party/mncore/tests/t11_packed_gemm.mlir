@@ -13,7 +13,9 @@ tt.func @packed_gemm() {
   %alo = "mncore.slab.load"(%a0, %a1, %a2, %a3) <{mode = 3 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token, !mncore.token, !mncore.token) -> vector<8xf32>
   %b0 = "mncore.lbop"() <{mem = 0 : i32, addr = 256 : i64, width = 1 : i32, flags = 0 : i32}> : () -> !mncore.token
   %b1 = "mncore.lbop"() <{mem = 0 : i32, addr = 320 : i64, width = 1 : i32, flags = 0 : i32}> : () -> !mncore.token
-  %b = "mncore.vec.load"(%b0, %b1) <{mode = 3 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
+  // x role: the two planes fill the slot's consecutive longwords 0 and 1
+  // (design doc 22.35), which is what a word-width fmfma x reads.
+  %b = "mncore.x.load"(%b0, %b1) <{mode = 3 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
   %c = "mncore.gemm.tile"(%alo, %alo, %b, %alo) <{face = 0 : i64}> : (vector<8xf32>, vector<8xf32>, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
   // K chaining: the next block accumulates into the previous result, on the
   // other face (design doc 22.28).

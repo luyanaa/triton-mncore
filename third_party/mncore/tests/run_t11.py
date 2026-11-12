@@ -32,11 +32,13 @@ def main() -> int:
 
     need = [
         "llvm.mncore.l1load.v8f32",   # the 4-longword A slab
-        "llvm.mncore.l1load.v4f32",   # the 2-longword B vector
+        "llvm.mncore.l1xload.v4f32",  # the 2-longword B x operand
         "llvm.mncore.matwrite.v8f32",  # two row groups of the face
         "llvm.mncore.matvec.v4f32",    # the MAU expression
     ]
     missing = [n for n in need if n not in llir]
+    if "llvm.mncore.l1load.v4f32" in llir:
+        missing.append("B loaded as a 2-longword vector, not the matrix x role")
     if missing or llir.count("llvm.mncore.matwrite.v8f32") != 4:
         print("T11 FAIL: missing " + ", ".join(missing or
                                                ["2 x 2 matwrite"]), file=sys.stderr)

@@ -18,9 +18,10 @@ Stages:
   R   relocation contract (§13.3/§13.5)      (run_reloc.py)
   F   Triton frontend regression             (run_frontend.py)
 
-`run_e2e_add.py`, `run_e2e_add2d.py` and `run_e2e_mnrt.py` need ssh to the
-emulator host and a working assemble3/gpfn3 (the last one also a built
-libmnrt), so they stay opt-in (`--remote`).
+`run_e2e_add.py`, `run_e2e_add2d.py`, `run_e2e_dot.py` and `run_e2e_mnrt.py`
+need ssh to the emulator host and a working assemble3/gpfn3 (the last one also
+a built libmnrt), so they stay opt-in (`--remote`). `run_e2e_dot.py` checks
+only the kernel's data path, not a product (G2 is open).
 
 Usage:
   PYTHONPATH=python python run_all.py [--remote]
@@ -94,6 +95,7 @@ def main() -> int:
     if "--remote" in sys.argv:
         for label, script in (("E2E", "run_e2e_add.py"),
                               ("E2E2D", "run_e2e_add2d.py"),
+                              ("E2EDOT", "run_e2e_dot.py"),
                               ("MNRT", "run_e2e_mnrt.py")):
             r = run([PY, script], HERE, env)
             if r.returncode != 0:

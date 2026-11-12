@@ -982,7 +982,11 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
           Value aHi = mncore::SlabLoadOp::create(
               body, dloc, f32v8, mncore::L1Mode::Distributed, hi[0], hi[1],
               hi[2], hi[3]);
-          Value bOp = mncore::VecLoadOp::create(
+          // B is the matrix x operand: 4 f32 per PE, read at word width over
+          // four cycles, so its two planes must land in the consecutive slot
+          // longwords 0 and 1 (mncore.x.load), not in the vector form's `ll`
+          // pair (design doc 22.35).
+          Value bOp = mncore::XLoadOp::create(
               body, dloc, f32v4, mncore::L1Mode::Distributed, bv[0], bv[1]);
           // K chaining is the accumulator, and the face alternates so a
           // block's matwrite never lands on the face the previous block's
