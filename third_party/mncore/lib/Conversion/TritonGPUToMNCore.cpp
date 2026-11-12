@@ -18,8 +18,12 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
+
+#include <optional>
+#include <utility>
 
 using namespace mlir;
 
@@ -394,33 +398,61 @@ static bool isIndexOnly(Operation *op) {
 // pseudocode, not a documented matrix-matrix operation.
 //
 // A kernel-level GEMM is therefore mwrite(A) then one fmfma per 4 columns of
-// B per 8-row M block, chaining K in blocks of 4 through y. Nothing of that
-// sequence exists yet, and the TTGIR a `tl.dot` produces today cannot feed it:
-// with a blocked parent, `fmaDotToLinearLayout` puts the whole K dimension in
-// every thread's registers (32 f32 per thread for a 32x32x32 dot), while the
-// MAU consumes K one element per PE. Every dot is rejected; the function only
-// chooses which clause of the contract to cite, so the diagnostic stays
-// actionable instead of degrading to "unsupported operation".
-// The blocked-GEMM contract (design doc 22.30): A is 16 f32 per PE (a_lo +
-// a_hi, placed into the face slots by 128 small DMAs), B is 4 f32 per PE from
-// a buffer written at deployment time in x layout (plane p, longword q =
-// B[2p][q%N], B[2p+1][q%N], replicated per MAB), and C is 8 f32 per PE, which
-// is exactly a slab, so the ordinary store path carries it back.
+// B per 8-row M block, chaining K in blocks of 4 through y.
 //
-// The compiler checks shapes and pointer provenance only; it does not
-// transpose and does not inspect the buffer, because no measured primitive
-// can produce a per-PE column assignment. A buffer that violates the layout
-// contract yields wrong numbers -- that is the caller's contract, stated in
-// 22.30 like the whole-tile and 0..N-1 offset rules.
-static LogicalResult checkNarrowDot(triton::DotOp dot) {
-  auto shapeOk = [](Value v, int64_t n) {
+// A TTGIR `tl.dot` cannot feed that sequence directly: with a blocked parent,
+// `fmaDotToLinearLayout` puts the whole K dimension in every thread's registers
+// (32 f32 per thread for a 32x32x32 dot), while the MAU consumes K one element
+// per PE, and no measured primitive can produce that per-PE assignment. The
+// blocked GEMM is therefore expressed as a KB x NB grid of `mncore.gemm.tile`
+// ops over *pre-arranged* buffers (design doc 22.30, 22.32, 22.34), and a dot
+// whose operands are not such buffers is rejected with a diagnostic that cites
+// the clause it violates.
+//
+// The dot carries the *logical* 2-D shapes -- A (M,K), B (K,N), C (M,N) -- so
+// the type system checks the algebra and the pass only adds the hardware
+// constraints. M is fixed at 128: one gemm.tile grid is exactly the 16 MABs
+// times the 8 face rows, and K and N must be multiples of the 4 the MAU
+// consumes per block. KB = K/4 and NB = N/4 are then the block counts.
+//
+// The buffers *at the operand pointers* are the pre-arranged, block-major
+// arrays (design doc 22.30, 22.32, 22.34) -- not the logical tiles:
+//
+//   A'  1024 * KB f32   block kb = 8 planes of 64 longwords (2x the logical
+//                       128x4 block: the face uses only even columns, so each
+//                       value sits alone in a longword's low half);
+//                       plane r, longword 4m+q = A[8m+r][4kb+q], low half
+//   B'  256 * KB*NB f32 block (kb,nb) = 2 planes of 64 longwords (16x the
+//                       logical 4x4 block: l1bmd gives each of the 64 PEs its
+//                       own 4 f32, so one MAB's 4x4 x operand is repeated 16
+//                       times), deployment-time layout, x per PE
+//   C   512 * NB f32    block nb = 4 planes, i.e. 8 f32 per PE -- exactly the
+//                       logical 128x4 C block, so no padding
+//
+// The compiler therefore reads 2x numel(A), 16x numel(B) and numel(C) f32 from
+// the three base pointers. A reader that treats those pointers as plain tiles
+// will over-read; the sizes are part of the kernel-argument contract, like the
+// whole-tile rule, and A is verified at dump level by
+// scripts/check_a_layout.py (22.33.4).
+static FailureOr<std::pair<unsigned, unsigned>>
+slicedDotShape(triton::DotOp dot) {
+  auto shape2 = [](Value v) -> std::optional<std::pair<int64_t, int64_t>> {
     auto t = dyn_cast<RankedTensorType>(v.getType());
-    return t && t.getElementType().isF32() && t.getNumElements() == n;
+    if (!t || t.getRank() != 2 || !t.getElementType().isF32())
+      return std::nullopt;
+    return std::make_pair(t.getShape()[0], t.getShape()[1]);
   };
-  if (!shapeOk(dot.getA(), 1024) || !shapeOk(dot.getB(), 256) ||
-      !shapeOk(dot.getC(), 512) || !shapeOk(dot.getResult(), 512))
+  auto a = shape2(dot.getA()), b = shape2(dot.getB());
+  auto c = shape2(dot.getC()), r = shape2(dot.getResult());
+  if (!a || !b || !c || !r)
     return failure();
-  return success();
+  int64_t M = a->first, K = a->second, N = c->second;
+  if (M != 128 || c->first != M || b->first != K || b->second != N ||
+      r->first != M || r->second != N)
+    return failure();
+  if (K % 4 != 0 || N % 4 != 0)
+    return failure();
+  return std::make_pair((unsigned)(K / 4), (unsigned)(N / 4));
 }
 
 static LogicalResult rejectDot(triton::DotOp dot) {
@@ -465,17 +497,19 @@ static LogicalResult rejectDot(triton::DotOp dot) {
   auto bLayout = bTy.getEncoding();
   return dot.emitError()
          << "tt.dot " << M << "x" << K << "x" << N
-         << " is not lowered yet; the MAU GEMM sequence is pending. A block "
-            "is: mwrite the 8x4 A tile into a matrix face, then one fmfma per "
-            "4 columns of B with x at word width (4 f32, one per PE) and "
-            "y/dst at longword width (8 f32, two per PE), chaining K in "
-            "blocks of 4 through y (mncore_intrinsics_design.md section 22). "
-            "This dot carries A: "
+         << " is not lowerable by the blocked-GEMM path: the sequence is one "
+            "mwrite of an 8x4 A tile into a matrix face and one fmfma per 4 "
+            "columns of B (x at word width, 4 f32 per PE; y/dst at longword "
+            "width, 8 f32 per PE), chaining K in blocks of 4 through y "
+            "(mncore_intrinsics_design.md section 22). One gemm.tile grid "
+            "covers exactly M = 128 (16 MABs x 8 face rows) with K and N "
+            "multiples of 4, and its operands must point at the pre-arranged "
+            "block buffers (2x numel for A, 16x for B). This dot carries A: "
          << aLayout << ", B: " << bLayout
-         << "; the blocked-parent dot-operand layout replicates the whole K "
+         << "; a blocked-parent dot-operand layout also replicates the whole K "
             "dimension into every thread's registers, whereas the MAU "
-            "consumes K one element per PE of a MAB, so the operands must be "
-            "given an mncore dot layout first";
+            "consumes K one element per PE of a MAB, so even a shape-"
+            "compatible dot must be given the mncore operand layout first";
 }
 
 static LogicalResult convertFunction(triton::FuncOp fn) {
@@ -491,13 +525,107 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
   if (!fn.getFunctionType().getResults().empty())
     return fn.emitError() << "kernel must return void";
 
-  // A dot is rejected before the linear walk: the contract is a property of
-  // the whole kernel (operand layout, K distribution), so citing it is more
-  // useful than letting the walk fail on some earlier op.
-  for (Operation &op : fn.getBody().front())
-    if (auto dot = dyn_cast<triton::DotOp>(op))
-      if (failed(checkNarrowDot(dot)))
-        return rejectDot(dot);
+  // A sliced dot owns its operand loads, the relayouts that put them into the
+  // dot-operand encoding, and its result store. The dot branch below emits the
+  // DMAs, the per-block slab loads, the chained gemm.tile ops and the
+  // per-block writeback itself, so the ordinary load/store/convert_layout
+  // paths must not run for those operations -- and any *other* use of those
+  // values would need that ordinary path, which has no meaning for a
+  // pre-arranged buffer. Resolving the ownership here keeps the diagnostic on
+  // the right op and keeps the walk free of half-materialised tiles.
+  //
+  // DotPlan holds the two block counts, the three operand loads and the store
+  // that writes C back.
+  struct DotPlan {
+    unsigned kb, nb;
+    triton::LoadOp a, b, c;
+    triton::StoreOp out;
+  };
+  DenseMap<Operation *, DotPlan> dotPlans;
+  DenseSet<Value> dotLoads;
+  DenseSet<Operation *> dotStores;
+  DenseSet<Operation *> dotRelayouts;
+  for (Operation &op : fn.getBody().front()) {
+    auto dot = dyn_cast<triton::DotOp>(op);
+    if (!dot)
+      continue;
+    auto blocks = slicedDotShape(dot);
+    // A synthesised zero accumulator is a property of the operand, not of the
+    // shape; name it first so `tl.dot(a, b)` gets an actionable message rather
+    // than "C must come from a whole-tile tt.load".
+    if (dot.getC().getDefiningOp<arith::ConstantOp>())
+      return dot.emitError()
+             << "a sliced dot cannot start from a compiler-synthesised zero "
+                "accumulator: the grid reads each C block from its buffer as "
+                "the initial y, and there is no immediate-to-PE-data "
+                "primitive to build a zero slab (the MAU's zeroing form is "
+                "mmul, matvec with y forced to 0, which this path does not "
+                "emit). Pass an explicit accumulator tile, i.e. load a "
+                "zeroed buffer";
+    if (failed(blocks))
+      return rejectDot(dot);
+    auto loadOf = [&](Value v, StringRef name,
+                      triton::LoadOp &out) -> LogicalResult {
+      // The dot operand encoding is a relayout away from the loaded tile in
+      // every real TTGIR; it only permutes registers, and the value is never
+      // materialised (the grid reads the buffer, not the tile), so one
+      // convert_layout is carried along and dropped with the load.
+      if (auto cl = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
+        if (!cl.getResult().hasOneUse())
+          return dot.emitError()
+                 << "a sliced dot's " << name
+                 << " relayout must have the dot as its only user: the value "
+                    "is not materialised";
+        dotRelayouts.insert(cl);
+        v = cl.getSrc();
+      }
+      auto ld = v.getDefiningOp<triton::LoadOp>();
+      if (!ld || !ld.getResult().hasOneUse())
+        return dot.emitError()
+               << "a sliced dot's " << name
+               << " must come from a whole-tile tt.load whose only user is "
+                  "(a relayout feeding) the dot: the block grid is defined "
+                  "over pre-arranged buffers (design doc 22.30), so the "
+                  "compiler places those buffers and cannot consume a "
+                  "computed operand";
+      out = ld;
+      return success();
+    };
+    DotPlan plan{blocks->first, blocks->second, nullptr, nullptr, nullptr,
+                 nullptr};
+    if (failed(loadOf(dot.getA(), "A", plan.a)) ||
+        failed(loadOf(dot.getB(), "B", plan.b)) ||
+        failed(loadOf(dot.getC(), "C", plan.c)))
+      return failure();
+    // The result is stored through a relayout in every real TTGIR (the dot
+    // produces the C encoding, the store wants the tile encoding); like the
+    // operand relayouts it is dead once the grid is emitted.
+    Value stored = dot.getResult();
+    if (stored.hasOneUse())
+      if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(*stored.getUsers().begin())) {
+        dotRelayouts.insert(cl);
+        stored = cl.getResult();
+      }
+    if (!stored.hasOneUse())
+      return dot.emitError()
+             << "a sliced dot's result must have exactly one use, the tt.store "
+                "that writes the C buffer: the block grid writes C block by "
+                "block through L1BM, so there is no register-level tile value "
+                "to hand to another operation";
+    plan.out = dyn_cast<triton::StoreOp>(*stored.getUsers().begin());
+    if (!plan.out || plan.out.getValue() != stored)
+      return dot.emitError()
+             << "a sliced dot's result must be consumed by a tt.store directly";
+    if (plan.out.getMask())
+      return plan.out.emitError()
+             << "a masked store cannot write a sliced dot's C buffer: the grid "
+                "writes whole 512xf32 blocks with slab transfers";
+    dotLoads.insert(plan.a.getResult());
+    dotLoads.insert(plan.b.getResult());
+    dotLoads.insert(plan.c.getResult());
+    dotStores.insert(plan.out);
+    dotPlans[&op] = plan;
+  }
 
   // Masking is likewise a property of the access, not of one PE: the global
   // path moves the whole 256xf32 tile with one DMA descriptor (src_arg names
@@ -560,8 +688,6 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
   Block &oldBody = fn.getBody().front();
   Block *newBody = newFn.addEntryBlock();
   DenseMap<Value, Value> map;
-  // Values that occupy two slabs (a dot's A): the second one.
-  DenseMap<Value, Value> mapHi;
   struct AllocInfo {
     uint64_t base;
     uint64_t longwords;
@@ -663,7 +789,12 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       auto c = map.find(add.getRhs());
       auto vec = convertTensorType(add.getType());
       if (a == map.end() || c == map.end() || failed(vec))
-        return add.emitError() << "addf operands are not mncore vectors";
+        return add.emitError()
+               << "addf operands are not mncore vectors: elementwise "
+                  "arithmetic runs on one 4xf32 vector per PE (a 256xf32 tile "
+                  "across the 64 PEs), and both operands must be whole-tile "
+                  "loads of that width -- the wider 512xf32 slab is a matrix "
+                  "operand only and feeds gemm.tile, not arith";
       auto res = mncore::VecAddOp::create(body, add.getLoc(), *vec, a->second,
                                                c->second);
       map[add.getResult()] = res;
@@ -722,6 +853,8 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
     // implies. Converting between two different distributions would need the
     // values moved between PEs, which the PE file has no instruction for.
     if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+      if (dotRelayouts.contains(cl.getOperation()))
+        continue;   // dead once the dot grid is emitted
       auto it = map.find(cl.getSrc());
       if (it == map.end())
         return cl.emitError()
@@ -747,25 +880,147 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
                 "replicated layout instead of broadcasting a loaded value";
 
     if (auto dot = dyn_cast<triton::DotOp>(op)) {
-      auto a = map.find(dot.getA());
-      auto ah = mapHi.find(dot.getA());
-      auto b = map.find(dot.getB());
-      auto c = map.find(dot.getC());
-      if (a == map.end() || ah == mapHi.end() || b == map.end() ||
-          c == map.end())
-        return dot.emitError()
-               << "packed dot operands must come from loaded tiles: A a "
-                  "1024xf32 tile (a_lo + a_hi), B a 256xf32 pre-packed tile, "
-                  "C a 512xf32 tile (design doc 22.22). B is not transposed "
-                  "by the compiler";
-      auto res = mncore::GemmTileOp::create(body, dot.getLoc(),
-                                            a->second.getType(), 0u, a->second,
-                                            ah->second, b->second, c->second);
-      map[dot.getResult()] = res;
+      DotPlan &plan = dotPlans.find(&op)->second;
+      // The three buffers come from the operand loads' pointer chains; their
+      // element counts were fixed by slicedDotShape, so only provenance and
+      // the store/C identity remain to check here.
+      auto bufferOf = [&](Value ptr, Operation *at, StringRef name,
+                          unsigned &arg) -> LogicalResult {
+        Value base;
+        int64_t n = 0;
+        if (!matchFullTile(ptr, base, n))
+          return at->emitError()
+                 << "a sliced dot's " << name
+                 << " must be a whole tile at `base_ptr` whose offsets are "
+                    "exactly the row-major index 0..N-1 (1-D "
+                    "`base_ptr + tl.arange(0, N)`, or a 2-D "
+                    "`base_ptr + rm[:, None] * C + rn[None, :]`): the block "
+                    "grid places whole buffers plane by plane, so partial "
+                    "addressing cannot be expressed";
+        auto itb = ptrArgs.find(base);
+        if (itb == ptrArgs.end())
+          return at->emitError()
+                 << "the " << name << " base is not a kernel buffer argument";
+        arg = itb->second;
+        return success();
+      };
+      unsigned aArg = 0, bArg = 0, cArg = 0, oArg = 0;
+      if (failed(bufferOf(plan.a.getPtr(), plan.a, "A", aArg)) ||
+          failed(bufferOf(plan.b.getPtr(), plan.b, "B", bArg)) ||
+          failed(bufferOf(plan.c.getPtr(), plan.c, "C", cArg)) ||
+          failed(bufferOf(plan.out.getPtr(), plan.out, "C store", oArg)))
+        return failure();
+      // The accumulator is read from the C operand's buffer and each block is
+      // written to the *store*'s buffer: these may be different arguments,
+      // exactly as `tl.dot(a, b, acc)` followed by `tl.store(c_ptr, d)`.
+
+      // One gemm.tile block: A' = 8 planes (a_lo rows 0-3, a_hi rows 4-7),
+      // B' = 2 planes (4 f32 per PE, the deployment-time x layout), C = 4
+      // planes (8 f32 per PE). The writeback gets a second 4-plane region so
+      // a block's DmaStore never races the next block's slab store.
+      uint64_t aWords = (uint64_t)plan.kb * 8 * 64;
+      uint64_t bWords = (uint64_t)plan.kb * plan.nb * 2 * 64;
+      uint64_t cWords = (uint64_t)plan.nb * 4 * 64;
+      auto carve = [](uint64_t &next, uint64_t longwords) {
+        uint64_t at = llvm::alignTo(next, 64);
+        next = at + longwords;
+        return at;
+      };
+      uint64_t l1A = carve(nextL1, aWords);
+      uint64_t l1B = carve(nextL1, bWords);
+      uint64_t l1C = carve(nextL1, cWords);
+      uint64_t l1O = carve(nextL1, cWords);
+      uint64_t l2A = carve(nextL2, aWords);
+      uint64_t l2B = carve(nextL2, bWords);
+      uint64_t l2C = carve(nextL2, cWords);
+      uint64_t l2O = carve(nextL2, cWords);
+      Location dloc = dot.getLoc();
+      if (wroteBack) {
+        mncore::FenceOp::create(body, dloc);
+        mncore::FenceOp::create(body, dloc);
+      }
+      // Every buffer is plane-ordered, so placement is a plain 64-longword
+      // copy per plane (design doc 22.33: MV moves 64 longwords at a time).
+      auto copyPlanes = [&](uint64_t planes, uint64_t l1, uint64_t l2,
+                            unsigned arg) {
+        for (uint64_t pl = 0; pl < planes; ++pl)
+          mncore::DmaOp::create(body, dloc, /*src_space=*/1u,
+                                /*src_addr=*/pl * 64, l2 + pl * 64,
+                                l1 + pl * 64, 64, nextTag++, 0u, arg);
+      };
+      copyPlanes(aWords / 64, l1A, l2A, aArg);
+      copyPlanes(bWords / 64, l1B, l2B, bArg);
+      copyPlanes(cWords / 64, l1C, l2C, cArg);
+      // The MV/L2B transfers are asynchronous; two empty steps separate them
+      // from the first L1BM read (measured on assemble3's hazard checker).
+      mncore::FenceOp::create(body, dloc);
+      mncore::FenceOp::create(body, dloc);
+
+      auto tokenType = mncore::TokenType::get(ctx);
+      auto f32v8 = VectorType::get({8}, Float32Type::get(ctx));
+      auto f32v4 = VectorType::get({4}, Float32Type::get(ctx));
+      auto lbops = [&](uint64_t addr, unsigned count) {
+        SmallVector<Value> toks;
+        for (unsigned j = 0; j < count; ++j)
+          toks.push_back(mncore::LbOpOp::create(body, dloc, tokenType, 0u,
+                                                addr + j * 64, 1u, 0u));
+        return toks;
+      };
+      for (unsigned n = 0; n < plan.nb; ++n) {
+        // C block n is the initial accumulator y of the K chain.
+        auto c0 = lbops(l1C + (uint64_t)n * 256, 4);
+        Value acc = mncore::SlabLoadOp::create(
+            body, dloc, f32v8, mncore::L1Mode::Distributed, c0[0], c0[1],
+            c0[2], c0[3]);
+        for (unsigned k = 0; k < plan.kb; ++k) {
+          auto lo = lbops(l1A + (uint64_t)k * 512, 4);
+          auto hi = lbops(l1A + (uint64_t)k * 512 + 256, 4);
+          auto bv = lbops(l1B + ((uint64_t)k * plan.nb + n) * 128, 2);
+          Value aLo = mncore::SlabLoadOp::create(
+              body, dloc, f32v8, mncore::L1Mode::Distributed, lo[0], lo[1],
+              lo[2], lo[3]);
+          Value aHi = mncore::SlabLoadOp::create(
+              body, dloc, f32v8, mncore::L1Mode::Distributed, hi[0], hi[1],
+              hi[2], hi[3]);
+          Value bOp = mncore::VecLoadOp::create(
+              body, dloc, f32v4, mncore::L1Mode::Distributed, bv[0], bv[1]);
+          // K chaining is the accumulator, and the face alternates so a
+          // block's matwrite never lands on the face the previous block's
+          // matvec is still reading (design doc 22.28).
+          acc = mncore::GemmTileOp::create(body, dloc, f32v8,
+                                           /*face=*/k % 2, aLo, aHi, bOp, acc);
+        }
+        auto o = lbops(l1O + (uint64_t)n * 256, 4);
+        mncore::SlabStoreOp::create(body, dloc, acc, mncore::L1Mode::Distributed,
+                                    o[0], o[1], o[2], o[3], /*set=*/0);
+        // Separate the PE collect from the L2B collect that reads L1BM.
+        mncore::FenceOp::create(body, dloc);
+        for (unsigned pl = 0; pl < 4; ++pl)
+          mncore::DmaStoreOp::create(body, dloc,
+                                     l1O + (uint64_t)n * 256 + pl * 64,
+                                     l2O + (uint64_t)n * 256 + pl * 64,
+                                     /*dr_addr=*/(uint64_t)n * 256 + pl * 64,
+                                     64, nextTag++, /*l1b=*/0, /*dr_arg=*/oArg);
+        wroteBack = true;
+        if (n + 1 < plan.nb) {
+          // Drain the L2BM local port before the next block's L1BM traffic.
+          mncore::FenceOp::create(body, dloc);
+          mncore::FenceOp::create(body, dloc);
+        }
+      }
       continue;
     }
 
     if (auto load = dyn_cast<triton::LoadOp>(op)) {
+      if (dotLoads.contains(load.getResult())) {
+        // The dot branch places this buffer itself, block by block.
+        if (load.getMask() || load.getOther())
+          return load.emitError()
+                 << "a sliced dot's operand loads cannot be masked: the block "
+                    "grid moves whole pre-arranged buffers, and `vec.*` masks "
+                    "select operand lanes, not buffer elements";
+        continue;
+      }
       if (load.getMask() || load.getOther())
         return load.emitError()
                << "only unmasked full-tile loads are supported";
@@ -788,11 +1043,12 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
       // `mncore.gemm.tile` is 4 longwords wide.
       unsigned perPe = rt ? (unsigned)(N / 64) : 0;
       if (!rt || !rt.getElementType().isF32() ||
-          (perPe != 4 && perPe != 8 && perPe != 16))
+          (perPe != 4 && perPe != 8))
         return load.emitError()
-               << "the global-load path supports 256xf32 (4 f32 per PE), "
-                  "512xf32 (8 f32 per PE, one matrix slab) or 1024xf32 "
-                  "(16 f32 per PE, the two slabs a dot's A needs)";
+               << "the global-load path supports 256xf32 (4 f32 per PE) or "
+                  "512xf32 (8 f32 per PE, one matrix slab); a dot's operand "
+                  "buffers are not loaded here at all -- the block grid places "
+                  "them itself";
       unsigned planes = perPe / 2;      // longwords per PE
       uint64_t planeWords = 64;         // one longword per PE, per plane
       uint64_t l1 = llvm::alignTo(nextL1, 64);
@@ -807,41 +1063,13 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         mncore::FenceOp::create(body, lloc);
         mncore::FenceOp::create(body, lloc);
       }
-      // A dot's A (1024 f32, 16 per PE) is not a contiguous plane layout: the
-      // face needs PE q of MAB m to hold row (8m+j)'s p-th longword in plane j
-      // at offset 4m (design doc 22.26). That is 16 MAB x 4 rows x 2 (a_lo,
-      // a_hi) = 128 contiguous size-2 transfers, expressed with the same DMA.
-      bool feedsDot = false;
-      if (perPe == 16)
-        for (Operation *user : load.getResult().getUsers())
-          if (isa<triton::DotOp>(user))
-            feedsDot = true;
-      if (feedsDot) {
-        // fmfma reads matrix columns 0/2/4/6, and column 2q can only come from
-        // PE q's longword LOW half (fmwrite), so PE q must hold K index q:
-        // the K dimension is spread over the four PEs, one K per PE. The
-        // source A' is therefore a *padded* buffer -- one longword per
-        // (MAB, row, K) with the value in the low half -- and each transfer
-        // moves the four K longwords of one row onto offsets 4m..4m+3.
-        for (unsigned m = 0; m < 16; ++m)
-          for (unsigned j = 0; j < 4; ++j)
-            for (unsigned half = 0; half < 2; ++half) {
-              uint64_t src = (uint64_t)half * 256 + (m * 4 + j) * 4;
-              uint64_t dst = l1 + (uint64_t)half * 4 * planeWords +
-                             64 * j + 4 * m;
-              mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
-                                    /*src_addr=*/src,
-                                    /*l2_addr=*/dst, /*l1_addr=*/dst,
-                                    /*size=*/4, nextTag++, 0u,
-                                    /*src_arg=*/arg);
-            }
-      } else {
-        for (unsigned pl = 0; pl < planes; ++pl)
-          mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
-                                /*src_addr=*/pl * planeWords,
-                                l2 + pl * planeWords, l1 + pl * planeWords,
-                                planeWords, nextTag++, 0u, /*src_arg=*/arg);
-      }
+      // The buffer is plane-ordered, so placement is one 64-longword copy per
+      // plane; MV moves 64 longwords at a time (design doc 22.33).
+      for (unsigned pl = 0; pl < planes; ++pl)
+        mncore::DmaOp::create(body, lloc, /*src_space=*/1u,
+                              /*src_addr=*/pl * planeWords,
+                              l2 + pl * planeWords, l1 + pl * planeWords,
+                              planeWords, nextTag++, 0u, /*src_arg=*/arg);
       // The MV/L2B transfers are asynchronous; the PE read must not share a
       // step with them. Two empty steps are required before the L1B read
       // (measured on assemble3's hazard checker: one is rejected).
@@ -861,18 +1089,14 @@ static LogicalResult convertFunction(triton::FuncOp fn) {
         value = mncore::SlabLoadOp::create(
             body, lloc, VectorType::get({8}, rt.getElementType()),
             mncore::L1Mode::Distributed, tok[0], tok[1], tok[2], tok[3]);
-        if (perPe == 16) {
-          // A dot's A is a_lo and a_hi: two slabs, rows 0-3 and 4-7.
-          mapHi[load.getResult()] = mncore::SlabLoadOp::create(
-              body, lloc, VectorType::get({8}, rt.getElementType()),
-              mncore::L1Mode::Distributed, tok[4], tok[5], tok[6], tok[7]);
-        }
       }
       map[load.getResult()] = value;
       continue;
     }
 
     if (auto store = dyn_cast<triton::StoreOp>(op)) {
+      if (dotStores.contains(&op))
+        continue;   // the dot branch wrote this buffer block by block
       if (store.getMask())
         return store.emitError()
                << "only unmasked full-tile stores are supported";

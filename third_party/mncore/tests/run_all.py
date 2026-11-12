@@ -14,6 +14,7 @@ Stages:
   T9  tt.dot / GEMM contract
   T10 rank-2 (2-D) Distributed tile
   T11 packed-dot landing sequence (structural; G2 open)
+  T12 K/N-blocked GEMM grid from one tt.dot (structural; G2 open)
   R   relocation contract (§13.3/§13.5)      (run_reloc.py)
   F   Triton frontend regression             (run_frontend.py)
 
@@ -45,6 +46,7 @@ STAGES = [
     ("T9", ["run_t9.py"]),
     ("T10", ["run_t10.py"]),
     ("T11", ["run_t11.py", "t11_packed_gemm.mlir"]),
+    ("T12", ["run_t12.py", "t12_sliced_gemm.mlir"]),
     ("R", ["run_reloc.py"]),
     ("F", ["run_frontend.py"]),
 ]

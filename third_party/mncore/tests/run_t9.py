@@ -31,11 +31,11 @@ TRITON_OPT = HERE.parents[2].parent / "triton-mncore-build" / "bin" / "triton-op
 # Rejection contract: (fixture, required needles, description).
 CASES = [
     ("t9_dot_contract.mlir",
-     ["is not lowered yet",
+     ["is not lowerable by the blocked-GEMM path",
       "one fmfma per 4 columns of B",
       "K one element per PE",
-      "the MAU GEMM sequence is pending"],
-     "the pending GEMM sequence and the operand-placement mismatch"),
+      "M = 128"],
+     "the M=128 grid and the operand-placement mismatch"),
     ("t9_dot_dtype_reject.mlir",
      ["is f32 only",
       "hmfma",

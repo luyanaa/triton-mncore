@@ -210,14 +210,14 @@ def main() -> int:
         else:
             print("PASS  two 2-D tiles per kernel: 8 DMA, 12 l1bmd, 4 l2bm@")
 
-    # --- rejections the 256xf32 global path cannot express -----------------
+    # --- rejections the elementwise path cannot express ---------------------
     for name, fn, sig, cexp, want in [
         ("masked-load", maskedk,
          {"a_ptr": "*fp32", "o_ptr": "*fp32",
           "R": "constexpr", "C": "constexpr"},
          {"R": 16, "C": 16}, "masked tile loads are not lowerable"),
-        ("512-element tile", add2dk, two_d_sig, {"R": 32, "C": 16},
-         "supports a 256xf32 tile"),
+        ("512-element elementwise tile", add2dk, two_d_sig,
+         {"R": 32, "C": 16}, "one 4xf32 vector per PE"),
     ]:
         mn, err = to_mncore(name, make_ttgir(fn, sig, cexp))
         if err is None:
