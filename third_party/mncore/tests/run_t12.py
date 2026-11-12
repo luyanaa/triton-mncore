@@ -43,6 +43,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 TRITON_OPT = HERE.parents[2].parent / "triton-mncore-build" / "bin" / "triton-opt"
@@ -50,6 +51,49 @@ TRITON_OPT = HERE.parents[2].parent / "triton-mncore-build" / "bin" / "triton-op
 # pass emits is one LLVM actually registered (see the note in 22.35.2).
 LLVM = pathlib.Path(os.environ.get(
     "LLVM_BIN", "/Users/yanlu/Documents/llvm-mncore/build-mlir/bin"))
+# The SDM stream interpreter lives in the LLVM tree (design doc 22.36). It is
+# optional: without llc or that script the numeric stage is skipped, and the
+# structural checks above still stand on their own.
+G3_SIM = (LLVM.parent.parent / "llvm" / "test" / "CodeGen" / "MNCore" /
+          "scripts" / "sim_gemm_stream.py")
+
+
+def g3_numeric(llvm_ir: str):
+    """Run the emitted 128x16x16 kernel under the SDM model (22.36).
+
+    Returns a list of failure strings. The positive run must match a golden
+    computed from the logical A/B/C; the negative run (the transposed B'
+    layout 22.34.1 used to document) must NOT match, or the comparison is not
+    comparing. This also pins the frozen fixture in the LLVM tree: if the pass
+    starts emitting different code, this re-derives it and disagrees."""
+    llc, translate = LLVM / "llc", LLVM / "mlir-translate"
+    if not (llc.exists() and translate.exists() and G3_SIM.exists()):
+        return False, []
+    ok = subprocess.run([str(translate), "--mlir-to-llvmir"], input=llvm_ir,
+                        capture_output=True, text=True)
+    if ok.returncode:
+        return True, ["g3: mlir-translate failed: " + ok.stdout + ok.stderr[:300]]
+    with tempfile.TemporaryDirectory() as d:
+        ll = pathlib.Path(d) / "t12.ll"
+        v = pathlib.Path(d) / "t12.vsm"
+        ll.write_text(ok.stdout)
+        r = subprocess.run([str(llc), "-mtriple=mncore2", str(ll), "-o", str(v)],
+                           capture_output=True, text=True)
+        if r.returncode:
+            return True, ["g3: llc failed: " + (r.stdout + r.stderr)[:300]]
+        pos = subprocess.run([sys.executable, "-I", str(G3_SIM), str(v)],
+                             capture_output=True, text=True)
+        neg = subprocess.run([sys.executable, "-I", str(G3_SIM), str(v),
+                              "--layout", "transposed"],
+                             capture_output=True, text=True)
+    fails = []
+    if pos.returncode:
+        fails.append("g3: the emitted stream does not compute A*B+C under the "
+                     "SDM model: " + (pos.stdout + pos.stderr).strip()[:300])
+    if not neg.returncode:
+        fails.append("g3: the transposed B' layout also matched -- the golden "
+                     "comparison is not discriminating")
+    return True, fails
 
 
 def run(name: str, *flags: str):
@@ -128,6 +172,15 @@ def main() -> int:
                     failures.append(
                         "t12: mlir-translate could not resolve an intrinsic "
                         "name: " + (r3.stdout + r3.stderr)[:400])
+                else:
+                    # Structure -> numerics: execute the emitted stream under
+                    # the SDM model (design doc 22.36). Model-level only; G2
+                    # (what the silicon does) stays open.
+                    ran, g3f = g3_numeric(r2.stdout)
+                    failures += g3f
+                    if ran and not g3f:
+                        print("PASS  t12: the emitted stream computes A*B+C "
+                              "under the SDM model (22.36)")
         if not failures:
             print(f"PASS  t12: 128x16x16 -> {kb}x{nb} gemm.tile grid "
                   f"({8*kb + 2*kb*nb + 4*nb} plane DMAs, K chained, faces 0/1)")
